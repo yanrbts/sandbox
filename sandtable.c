@@ -78,7 +78,6 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
-
 #include "list.h"
 
 /* Log levels */
@@ -120,6 +119,8 @@
 #define ANET_ERR -1
 #define ANET_ERR_LEN 256
 #define NET_IP_STR_LEN 46 /* INET6_ADDRSTRLEN is 46, but we need to be sure */
+
+#define CONFIG_DEFAULT_TCP_KEEPALIVE 300
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
@@ -218,6 +219,7 @@ struct Server {
     uint32_t tcpport;       /* Server Tcp Port */
     int ipfd;               /* TCP socket file descriptors */
     int tcp_backlog;        /* TCP listen() backlog */
+    int tcpkeepalive;       /* Set SO_KEEPALIVE if non-zero. */
     char *logfile;          /* Path of log file */
     struct list_head clist; /* List of client*/
     uint32_t clist_size;    /* number of client */
@@ -271,6 +273,20 @@ static void _serverLog(int level, const char *fmt, ...) {
     va_end(ap);
 
     sLogRaw(level,msg);
+}
+
+static long long ustime(void) {
+    struct timeval tv;
+    long long ust;
+
+    gettimeofday(&tv, NULL);
+    ust = ((long long)tv.tv_sec)*1000000;
+    ust += tv.tv_usec;
+    return ust;
+}
+
+static long long mstime(void) {
+    return ustime()/1000;
 }
 
 /*********************************EPOLL*****************************************/
@@ -850,12 +866,58 @@ static int anetSetBlock(int fd, int non_block) {
     return ANET_OK;
 }
 
-static int anetNonBlock(char *err, int fd) {
+static int anetNonBlock(int fd) {
     return anetSetBlock(fd,1);
 }
 
-static int anetBlock(char *err, int fd) {
+static int anetBlock(int fd) {
     return anetSetBlock(fd,0);
+}
+
+/* Set TCP keep alive option to detect dead peers. The interval option
+ * is only used for Linux as we are using Linux-specific APIs to set
+ * the probe send time, interval, and count. */
+static int anetKeepAlive(int fd, int interval) {
+    int val = 1;
+
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &val, sizeof(val)) == -1) {
+        serverLog(LL_DEBUG, "setsockopt SO_KEEPALIVE: %s", strerror(errno));
+        return ANET_ERR;
+    }
+
+#ifdef __linux__
+    /* Default settings are more or less garbage, with the keepalive time
+     * set to 7200 by default on Linux. Modify settings to make the feature
+     * actually useful. */
+
+    /* Send first probe after interval. */
+    val = interval;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &val, sizeof(val)) < 0) {
+        serverLog(LL_DEBUG, "setsockopt TCP_KEEPIDLE: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+
+    /* Send next probes after the specified interval. Note that we set the
+     * delay as interval / 3, as we send three probes before detecting
+     * an error (see the next setsockopt call). */
+    val = interval/3;
+    if (val == 0) val = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &val, sizeof(val)) < 0) {
+        serverLog(LL_DEBUG, "setsockopt TCP_KEEPINTVL: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+
+    /* Consider the socket in error state after three we send three ACK
+     * probes without getting a reply. */
+    val = 3;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &val, sizeof(val)) < 0) {
+        serverLog(LL_DEBUG, "setsockopt TCP_KEEPCNT: %s\n", strerror(errno));
+        return ANET_ERR;
+    }
+#else
+    ((void) interval); /* Avoid unused var warning for non Linux systems. */
+#endif
+    return ANET_OK;
 }
 
 static int anetTcpServer(int port, char *bindaddr, int backlog) {
@@ -864,6 +926,26 @@ static int anetTcpServer(int port, char *bindaddr, int backlog) {
 
 static int anetTcp6Server(int port, char *bindaddr, int backlog) {
     return _anetTcpServer(port, bindaddr, AF_INET6, backlog);
+}
+
+static int anetSetTcpNoDelay(int fd, int val)
+{
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) == -1)
+    {
+        serverLog(LL_DEBUG, "setsockopt TCP_NODELAY: %s", strerror(errno));
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
+
+int anetEnableTcpNoDelay(int fd)
+{
+    return anetSetTcpNoDelay(fd, 1);
+}
+
+int anetDisableTcpNoDelay(int fd)
+{
+    return anetSetTcpNoDelay(fd, 0);
 }
 
 static int anetGenericAccept(int s, struct sockaddr *sa, socklen_t *len) {
@@ -921,7 +1003,7 @@ int listenToPort(int port, int *fd) {
 
     *fd = anetTcp6Server(port, NULL, sdserver.tcp_backlog);
     if (*fd != ANET_ERR) {
-        anetNonBlock(NULL, *fd);
+        anetNonBlock(*fd);
     } else if (errno == EAFNOSUPPORT) {
         unsupported++;
         serverLog(LL_WARNING,"Not listening to IPv6: unsupproted");
@@ -931,7 +1013,7 @@ int listenToPort(int port, int *fd) {
         /* Bind the IPv4 address as well. */
         *fd = anetTcpServer(port, NULL, sdserver.tcp_backlog);
         if (*fd != ANET_ERR) {
-            anetNonBlock(NULL, *fd);
+            anetNonBlock(*fd);
         } else if (errno == EAFNOSUPPORT) {
             unsupported++;
             serverLog(LL_WARNING,"Not listening to IPv4: unsupproted");
@@ -961,7 +1043,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                     "Accepting client connection: %s", strerror(errno));
             return;
         }
-        serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
+        serverLog(LL_VERBOSE, "Accepted %s:%d", cip, cport);
         acceptCommonHandler(cfd, 0, cip);
     }
 }
@@ -1005,6 +1087,7 @@ void sdInitServer(void) {
     sdserver.logfile = NULL;
     sdserver.udpip = NULL;
     sdserver.udpport = 0;
+    sdserver.tcpkeepalive = CONFIG_DEFAULT_TCP_KEEPALIVE;
     sdserver.el = aeCreateEventLoop(1024);
     if (sdserver.el == NULL) {
         serverLog(LL_WARNING,
@@ -1033,6 +1116,45 @@ void sdInitServer(void) {
     }
 }
 
+/************************************CLIENT***************************************/
+
+void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+}
+
+Client *createClient(int fd) {
+    Client *c = malloc(sizeof(Client));
+
+    if (c == NULL) return NULL;
+
+    if (fd != -1) {
+        anetNonBlock(fd);
+        anetEnableTcpNoDelay(fd);
+        if (sdserver.tcpkeepalive)
+            anetKeepAlive(fd, sdserver.tcpkeepalive);
+        
+        if (aeCreateFileEvent(sdserver.el,fd,AE_READABLE,
+            readQueryFromClient, c) == AE_ERR)
+        {
+            close(fd);
+            free(c);
+            return NULL;
+        }
+    }
+
+    c->ctime = time(NULL);
+    c->fd = fd;
+    c->isonline = true;
+    list_add(&c->list, &sdserver.clist);
+
+    return c;
+}
+
+void freeClient(Client *c) {
+    list_del(&c->list);
+    close(c->fd);
+    free(c);
+}
+
 int main(int argc, char *argv[]) {
     /* The setlocale() function is used to set or query the program's current locale.
      * 
@@ -1048,5 +1170,8 @@ int main(int argc, char *argv[]) {
     tzset();
 
     sdInitServer();
+    aeMain(sdserver.el);
+    aeDeleteEventLoop(sdserver.el);
+    
     return 0;
 }
