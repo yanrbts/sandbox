@@ -866,6 +866,42 @@ static int anetTcp6Server(int port, char *bindaddr, int backlog) {
     return _anetTcpServer(port, bindaddr, AF_INET6, backlog);
 }
 
+static int anetGenericAccept(int s, struct sockaddr *sa, socklen_t *len) {
+    int fd;
+    while (1) {
+        fd = accept(s, sa, len);
+        if (fd == -1) {
+            if (errno == EINTR)
+                continue;
+            else {
+                serverLog(LL_DEBUG, "accept: %s", strerror(errno));
+                return ANET_ERR;
+            }
+        }
+        break;
+    }
+    return fd;
+}
+
+int anetTcpAccept(int s, char *ip, size_t ip_len, int *port) {
+    int fd;
+    struct sockaddr_storage sa;
+    socklen_t salen = sizeof(sa);
+    if ((fd = anetGenericAccept(s,(struct sockaddr*)&sa,&salen)) == -1)
+        return ANET_ERR;
+
+    if (sa.ss_family == AF_INET) {
+        struct sockaddr_in *s = (struct sockaddr_in *)&sa;
+        if (ip) inet_ntop(AF_INET,(void*)&(s->sin_addr),ip,ip_len);
+        if (port) *port = ntohs(s->sin_port);
+    } else {
+        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&sa;
+        if (ip) inet_ntop(AF_INET6,(void*)&(s->sin6_addr),ip,ip_len);
+        if (port) *port = ntohs(s->sin6_port);
+    }
+    return fd;
+}
+
 /* Initialize a set of file descriptors to listen to the specified 'port'
  * binding the addresses specified in the server configuration.
  *
@@ -906,6 +942,10 @@ int listenToPort(int port, int *fd) {
 }
 
 #define MAX_ACCEPTS_PER_CALL 1000
+static void acceptCommonHandler(int fd, int flags, char *ip) {
+
+}
+
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
     char cip[NET_IP_STR_LEN];
@@ -914,7 +954,15 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     AE_NOTUSED(privdata);
 
     while (max--) {
-        
+        cfd = anetTcpAccept(fd, cip, sizeof(cip), &cport);
+        if (cfd == ANET_ERR) {
+            if (errno != EWOULDBLOCK)
+                serverLog(LL_WARNING,
+                    "Accepting client connection: %s", strerror(errno));
+            return;
+        }
+        serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
+        acceptCommonHandler(cfd, 0, cip);
     }
 }
 
@@ -945,9 +993,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     return 0;
 }
 
-
-
-int sdInitServer(void) {
+void sdInitServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
 
@@ -975,6 +1021,13 @@ int sdInitServer(void) {
      * operations incrementally, like clients timeout, eviction of unaccessed
      * expired keys and so forth. */
     if (aeCreateTimeEvent(sdserver.el, 1, serverCron, NULL, NULL) == AE_ERR) {
+        serverLog(LL_DEBUG, "Can't create event loop timers.");
+        exit(1);
+    }
+
+    if (aeCreateFileEvent(sdserver.el, sdserver.ipfd, 
+        AE_READABLE, acceptTcpHandler,NULL) == AE_ERR)
+    {
         serverLog(LL_DEBUG, "Can't create event loop timers.");
         exit(1);
     }
