@@ -77,7 +77,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
-#include <stdio.h>
+#include <inttypes.h>
 #include "list.h"
 
 /* Log levels */
@@ -120,36 +120,17 @@
 #define ANET_ERR_LEN 256
 #define NET_IP_STR_LEN 46 /* INET6_ADDRSTRLEN is 46, but we need to be sure */
 
-#define CONFIG_DEFAULT_TCP_KEEPALIVE 300
+#define CONFIG_DEFAULT_TCP_KEEPALIVE        300
+#define CONFIG_DEFAULT_TCP_BACKLOG          511    /* TCP listen backlog. */
+#define PROTO_MAX_QUERYBUF_LEN              (1024*1024*1024) /* 1GB max query buffer. */
+#define PROTO_IOBUF_LEN                     (1024*16)  /* Generic I/O buffer size */
+#define CONFIG_DEFAULT_FILE                 "./config.conf"
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
 #define serverLog(level, ...) do {      \
         _serverLog(level, __VA_ARGS__); \
     } while(0)
-
-enum sd_enum_types {
-    A001,
-    A002,
-    A003,
-    A004,
-    B001,
-    B002,
-    B003,
-    B004,
-};
-
-static const char *udpmsg[] = {
-    "A001",
-    "A002",
-    "A003",
-    "A004",
-    "B001",
-    "B002",
-    "B003",
-    "B004",
-    NULL
-};
 
 struct aeEventLoop;
 /* Types and data structures */
@@ -159,6 +140,8 @@ typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientDat
 
 typedef struct Client {
     int fd;                 /* socket file handle */
+    char *querybuf;         /* request data */
+    size_t len;             /* length of request data */
     bool isonline;          /* Determine whether the client is online */
     time_t ctime;           /* Client creation time. */
     struct list_head list;
@@ -166,6 +149,11 @@ typedef struct Client {
 
 typedef struct Lamp {
     struct list_head list;
+    uint16_t id;            /* lamp index */
+    char *open;             /* open lamp command */
+    char *close;            /* close lamp command */
+    long long starttime;    /* open time */
+    long long mtime;        /* If the light is on, how long does it take before it turns off?*/
     bool isopen;            /* Is the light on? */
 } Lamp;
 
@@ -214,6 +202,7 @@ typedef struct aeEventLoop {
 } aeEventLoop;
 
 struct Server {
+    char *configfile;       /* config file path */
     char *udpip;            /* Sandbox router address*/
     uint32_t udpport;       /* Sandbox router port */
     uint32_t tcpport;       /* Server Tcp Port */
@@ -225,9 +214,18 @@ struct Server {
     uint32_t clist_size;    /* number of client */
     struct list_head lamplist; /* List of lamp */
     uint32_t lamp_size;     /* number of lamp */
+    size_t client_max_querybuf_len; /* Limit for client query buffer length */
     /* epoll */
     aeEventLoop *el;        /* main event loop object*/
 } sdserver;
+
+static Client *createClient(int fd);
+static void freeClient(Client *c);
+static void setupSignalHandlers(void);
+static int sdSendUdpPage(const char *msg);
+static char *zstrdup(const char *s);
+static void sdLampInit(void);
+static void showLamplist(void);
 
 static void sLogRaw(int level, const char *msg) {
     const char *c = ".-*#@";
@@ -337,7 +335,10 @@ static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
     if (mask & AE_READABLE) ee.events |= EPOLLIN;
     if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
     ee.data.fd = fd;
-    if (epoll_ctl(state->epfd,op,fd,&ee) == -1) return -1;
+    if (epoll_ctl(state->epfd,op,fd,&ee) == -1) {
+        serverLog(LL_DEBUG, "epoll_ctl error");
+        return -1;
+    }
     return 0;
 }
 
@@ -385,9 +386,9 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
     return numevents;
 }
 
-static char *aeApiName(void) {
-    return "epoll";
-}
+// static char *aeApiName(void) {
+//     return "epoll";
+// }
 
 static aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
@@ -1001,31 +1002,40 @@ int anetTcpAccept(int s, char *ip, size_t ip_len, int *port) {
 int listenToPort(int port, int *fd) {
     int unsupported = 0;
 
-    *fd = anetTcp6Server(port, NULL, sdserver.tcp_backlog);
-    if (*fd != ANET_ERR) {
-        anetNonBlock(*fd);
-    } else if (errno == EAFNOSUPPORT) {
-        unsupported++;
-        serverLog(LL_WARNING,"Not listening to IPv6: unsupproted");
-    }
+    // *fd = anetTcp6Server(port, NULL, sdserver.tcp_backlog);
+    // if (*fd != ANET_ERR) {
+    //     anetNonBlock(*fd);
+    //     serverLog(LL_WARNING,"IPv6: supproted");
+    // } else if (errno == EAFNOSUPPORT) {
+    //     unsupported++;
+    //     serverLog(LL_WARNING,"Not listening to IPv6: unsupproted");
+    // }
 
-    if (unsupported) {
+    // if (unsupported) {
         /* Bind the IPv4 address as well. */
         *fd = anetTcpServer(port, NULL, sdserver.tcp_backlog);
         if (*fd != ANET_ERR) {
             anetNonBlock(*fd);
+            serverLog(LL_WARNING,"IPv4: supproted");
         } else if (errno == EAFNOSUPPORT) {
             unsupported++;
             serverLog(LL_WARNING,"Not listening to IPv4: unsupproted");
             return C_ERR;
         }
-    }
+    // }
     return C_OK;
 }
 
 #define MAX_ACCEPTS_PER_CALL 1000
 static void acceptCommonHandler(int fd, int flags, char *ip) {
-
+    Client *c;
+    if ((c = createClient(fd)) == NULL) {
+        serverLog(LL_WARNING,
+            "Error registering fd event for the new client: %s (fd=%d)",
+            strerror(errno),fd);
+        close(fd); /* May be already closed, just ignore errors */
+        return;
+    }
 }
 
 void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
@@ -1037,6 +1047,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     while (max--) {
         cfd = anetTcpAccept(fd, cip, sizeof(cip), &cport);
+        serverLog(LL_DEBUG, "client ip (%s) fd (%d)", cip, cfd);
         if (cfd == ANET_ERR) {
             if (errno != EWOULDBLOCK)
                 serverLog(LL_WARNING,
@@ -1068,7 +1079,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  */
 
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    int j;
+    // int j;
     AE_NOTUSED(eventLoop);
     AE_NOTUSED(id);
     AE_NOTUSED(clientData);
@@ -1078,16 +1089,22 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 void sdInitServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
+    setupSignalHandlers();
 
     INIT_LIST_HEAD(&sdserver.clist);
     INIT_LIST_HEAD(&sdserver.lamplist);
     sdserver.tcpport = SD_DEFAULT_TPORT;
     sdserver.clist_size = 0;
     sdserver.lamp_size = 0;
-    sdserver.logfile = NULL;
-    sdserver.udpip = NULL;
-    sdserver.udpport = 0;
+    sdserver.logfile = zstrdup("");
+    sdserver.udpip = "192.168.1.18";
+    sdserver.udpport = 1000;
     sdserver.tcpkeepalive = CONFIG_DEFAULT_TCP_KEEPALIVE;
+    sdserver.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
+    sdserver.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
+    sdserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
+    sdLampInit();
+    showLamplist();
     sdserver.el = aeCreateEventLoop(1024);
     if (sdserver.el == NULL) {
         serverLog(LL_WARNING,
@@ -1117,11 +1134,80 @@ void sdInitServer(void) {
 }
 
 /************************************CLIENT***************************************/
+static char *zstrdup(const char *s) {
+    size_t l = strlen(s)+1;
+    char *p = malloc(l);
 
-void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    memcpy(p,s,l);
+    return p;
 }
 
-Client *createClient(int fd) {
+static void *sd_realloc(void *ptr, size_t size) {
+    void *newptr;
+
+    if (ptr == NULL) return malloc(size);
+    newptr = realloc(ptr, size);
+    if (newptr == NULL) return NULL;
+    return newptr;
+}
+
+void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    Client *c = (Client*)privdata;
+    int nread, readlen;
+    size_t qblen = 0;
+    AE_NOTUSED(el);
+    AE_NOTUSED(mask);
+    
+    readlen = PROTO_IOBUF_LEN;
+    
+    if (c->querybuf != NULL) {
+        qblen = c->len;
+        serverLog(LL_VERBOSE, "Reading Data Length (%d)", qblen);
+    }
+
+    /* +1 for adding terminator*/
+    c->querybuf = sd_realloc(c->querybuf, qblen+readlen+1);
+    if (c->querybuf == NULL) {
+        serverLog(LL_VERBOSE, "Memory allocation failed");
+        freeClient(c);
+        return;
+    }
+
+    nread = read(fd, c->querybuf+qblen, readlen);
+    if (nread == -1) {
+        if (errno == EAGAIN) {
+            return;
+        } else {
+            serverLog(LL_VERBOSE, "Reading from client: %s",strerror(errno));
+            freeClient(c);
+            return;
+        }
+    } else if (nread == 0) {
+        serverLog(LL_VERBOSE, "Client closed connection");
+        freeClient(c);
+        return;
+    }
+
+    c->len += nread;
+
+    if (c->len >= sdserver.client_max_querybuf_len) {
+        serverLog(LL_WARNING,"Closing client that reached max query buffer length: %lu", c->len);
+        freeClient(c);
+        return;
+    }
+
+    /* If the data is relatively large and the fragment is accepted several times, 
+     * \0 is added each time, but every time the data is appended, it starts from \0. 
+     * This ensures that the data acceptance is completed and only the 
+     * \0 terminator will be added at the end to ensure the integrity of the data. */
+    c->querybuf[qblen+nread] = '\0';
+
+    // printf("%s\n", c->querybuf);
+    serverLog(LL_NOTICE, "data length: %lu", c->len);
+    sdSendUdpPage("A0001");
+}
+
+static Client *createClient(int fd) {
     Client *c = malloc(sizeof(Client));
 
     if (c == NULL) return NULL;
@@ -1144,15 +1230,172 @@ Client *createClient(int fd) {
     c->ctime = time(NULL);
     c->fd = fd;
     c->isonline = true;
+    c->querybuf = NULL;
+    c->len = 0;
     list_add(&c->list, &sdserver.clist);
+    sdserver.clist_size++;
 
     return c;
 }
 
-void freeClient(Client *c) {
+static void freeClient(Client *c) {
     list_del(&c->list);
-    close(c->fd);
+
+    if (c->fd != -1) {
+        aeDeleteFileEvent(sdserver.el, c->fd, AE_READABLE);
+        aeDeleteFileEvent(sdserver.el, c->fd, AE_WRITABLE);
+        close(c->fd);
+        c->fd = -1;
+    }
+    if (c->querybuf != NULL) free(c->querybuf);
     free(c);
+    sdserver.clist_size--;
+}
+
+/******************************LAMP**************************************/
+#define CONFIG_READ_LEN 1024
+static inline uint16_t lamp_index(const char *s) {
+    uint16_t idx = 0;
+    sscanf(s, "%*[^0-9]%hu", &idx);
+    return idx;
+}
+
+static void showLamplist(void) {
+    Lamp *lp = NULL;
+    Lamp *t = NULL;
+
+    serverLog(LL_WARNING, "Lamp Number : %" PRIu32 "", sdserver.lamp_size);
+    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
+    {
+        printf("\t--(%" PRIu16 ") %s:%s (%s)--\n", 
+            lp->id, lp->open, lp->close,
+            lp->isopen ? "true" : "false");
+    }
+}
+
+static Lamp *createLamp(char *op, char *cl) {
+    Lamp *lp = malloc(sizeof(*lp));
+
+    if (lp == NULL) return NULL;
+    lp->starttime = 0;
+    lp->mtime = 0;
+    lp->id = lamp_index(cl);
+    lp->open = op;
+    lp->close = cl;
+    lp->isopen = false;
+
+    list_add(&lp->list, &sdserver.lamplist);
+    sdserver.lamp_size++;
+
+    return lp;
+}
+
+static void sdLampInit(void) {
+    FILE *fp;
+    char buf[CONFIG_READ_LEN+1];
+
+    fp = fopen(sdserver.configfile, "r");
+    if (fp == NULL) {
+        serverLog(LL_DEBUG, "Error open config file");
+        exit(1);
+    }
+
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        char *p = buf;
+        /* Remove whitespace characters at the beginning of the line */
+        while (*p == ' ' || *p == '\t')
+            p++;
+        /* Skip lines starting with # */
+        if (p[0] == '#')
+            continue;
+        
+        /* Remove newlines at the end of lines */
+        p[strcspn(p, "\n")] = '\0';
+
+        char *open = strtok(p, " ");
+        char *close = strtok(NULL, " ");
+
+        (void)createLamp(zstrdup(open), zstrdup(close));
+    }
+    fclose(fp);
+}
+
+/*******************************UDP*************************************/
+
+/* Send udp packet to sandbox Control the sand table signal light on and off*/
+static int sdSendUdpPage(const char *msg) {
+    int sfd;
+    ssize_t sent_len;
+    struct sockaddr_in server_addr;
+
+    sfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sfd < 0) {
+        serverLog(LL_DEBUG, "UDP Socket creation failed");
+        return C_ERR;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(sdserver.udpport);
+    if (inet_pton(AF_INET, sdserver.udpip, &server_addr.sin_addr) <= 0) {
+        close(sfd);
+        return C_ERR;
+    }
+
+    sent_len = sendto(sfd, msg, strlen(msg), 0, 
+        (struct sockaddr *)&server_addr, sizeof(server_addr));
+    
+    if (sent_len < 0) {
+        serverLog(LL_DEBUG, "UDP (%s) Message send failed", msg);
+        close(sfd);
+        return C_ERR;
+    }
+    serverLog(LL_DEBUG, "UDP (%s) Message sent successfully", msg);
+
+    close(sfd);
+    return C_OK;
+}
+
+/*******************************SINGLE*********************************/
+static void sigShutdownHandler(int sig) {
+    char *msg;
+
+    switch (sig) {
+    case SIGINT:
+        msg = "Received SIGINT scheduling shutdown...";
+        break;
+    case SIGTERM:
+        msg = "Received SIGTERM scheduling shutdown...";
+        break;
+    default:
+        msg = "Received shutdown signal, scheduling shutdown...";
+    }
+
+    /* SIGINT is often delivered via Ctrl+C in an interactive session.
+     * If we receive the signal the second time, we interpret this as
+     * the user really wanting to quit ASAP without waiting to persist
+     * on disk. */
+    if (sig == SIGINT) {
+        serverLog(LL_WARNING, "You insist... exiting now.");
+        aeStop(sdserver.el);
+        exit(1); /* Exit with an error since this was not a clean shutdown. */
+    } else {
+        exit(0);
+    }
+    serverLog(LL_WARNING, msg);
+}
+
+static void setupSignalHandlers(void) {
+    struct sigaction act;
+
+    /* When the SA_SIGINFO flag is set in sa_flags then sa_sigaction is used.
+     * Otherwise, sa_handler is used. */
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = sigShutdownHandler;
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT, &act, NULL);
+    return;
 }
 
 int main(int argc, char *argv[]) {
