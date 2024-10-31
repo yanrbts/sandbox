@@ -1102,10 +1102,25 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
  */
 
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
-    // int j;
+    Lamp *lp;
+    Lamp *t;
+    long long nowtm;
+
     AE_NOTUSED(eventLoop);
     AE_NOTUSED(id);
     AE_NOTUSED(clientData);
+
+    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
+    {
+        nowtm = mstime();
+        if (lp->isopen && (lp->starttime+lp->mtime < nowtm)) {
+            lp->isopen = false;
+            lp->mtime = 0;
+            lp->starttime = 0;
+            sdSendUdpPage(lp->close);
+            serverLog(LL_VERBOSE, "When time expires, turn off the signal light");
+        }
+    }
     return 0;
 }
 
@@ -1235,18 +1250,6 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     /* Start parsing commands */
     apiCommand(c);
-
-    // printf("%s\n", c->querybuf);
-    // serverLog(LL_NOTICE, "data length: %lu", c->len);
-    // sdSendUdpPage("A0001");
-    // char *p = "yrb12222222222222222222222222222222222222222777777777777777777123e";
-    // addReplyString(c, p, strlen(p));
-    // char *p2 = "12455";
-    // addReplyString(c, p2, strlen(p2));
-
-    // p2 = "dfsdfsdfdsfdsfdsfdsfsdfjjjjjjjjjjjjjjjj";
-    // addReplyString(c, p2, strlen(p2));
-    // addReplyString(c,"\r\n",2);
 }
 
 static Client *createClient(int fd) {
@@ -1456,6 +1459,18 @@ static Lamp *createLamp(char *op, char *cl) {
     return lp;
 }
 
+static void freeLamp(void) {
+    Lamp *lp;
+    Lamp *t;
+
+    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
+        list_del(&lp->list);
+        free(lp->close);
+        free(lp->open);
+        free(lp);
+    }
+}
+
 static void sdLampInit(void) {
     FILE *fp;
     char buf[CONFIG_READ_LEN+1];
@@ -1560,6 +1575,7 @@ static int apiSet(Client *c, cJSON *root) {
             goto err;
         }
 
+        /* mtime is measured in seconds, then converted to milliseconds */
         mtime = cJSON_GetObjectItemCaseSensitive(lamp, "mtime");
         if (cJSON_IsNumber(action)) {
             mt = mtime->valueint*1000;
@@ -1668,6 +1684,7 @@ static void sigShutdownHandler(int sig) {
         msg = "Received shutdown signal, scheduling shutdown...";
     }
 
+    freeLamp();
     /* SIGINT is often delivered via Ctrl+C in an interactive session.
      * If we receive the signal the second time, we interpret this as
      * the user really wanting to quit ASAP without waiting to persist
