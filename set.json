@@ -1,0 +1,8 @@
+{
+    "method": "set",
+    "lamp": {
+        "id": 1,
+        "action": 1,
+        "mtime": 1000
+    }
+}

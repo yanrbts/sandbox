@@ -225,49 +225,11 @@ import struct
 def connect_to_tcp_server(host='localhost', port=8899):
     # 创建一个复杂的结构化 JSON 数据
     data = {
-        "company": "Tech Innovations Ltd.",
-        "address": {
-            "street": "123 Innovation Drive",
-            "city": "Silicon Valley",
-            "state": "CA",
-            "zip": "94043"
-        },
-        "employees": [
-            {
-                "id": 1,
-                "name": "Alice Johnson",
-                "age": 29,
-                "position": "Software Engineer",
-                "bio": "A" * 3500  # 填充到接近 4096 字符
-            },
-            {
-                "id": 2,
-                "name": "Alice Johnson2",
-                "age": 30,
-                "position": "Software Engineer",
-                "bio": "B" * 3500  # 填充到接近 4096 字符
-            },
-            {
-                "id": 3,
-                "name": "Alice Johnson3",
-                "age": 29,
-                "position": "Software Engineer",
-                "bio": "C" * 3500  # 填充到接近 4096 字符
-            }
-        ],
-        "departments": [
-            {
-                "department_id": 1,
-                "department_name": "Engineering",
-                "manager": "Alice Johnson",
-                "employees": [1]
-            }
-        ],
-        "financials": {
-            "fiscal_year": 2023,
-            "revenue": 1500000,
-            "expenses": 850000,
-            "profit": 650000
+        "method": "set",
+        "lamp": {
+            "id": 1,
+            "action": 0,
+            "mtime": 1000
         }
     }
     json_data = json.dumps(data)

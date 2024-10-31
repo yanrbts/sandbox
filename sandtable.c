@@ -79,6 +79,7 @@
 #include <netdb.h>
 #include <inttypes.h>
 #include "list.h"
+#include "cJSON.h"
 
 /* Log levels */
 #define LL_DEBUG 0
@@ -124,6 +125,8 @@
 #define CONFIG_DEFAULT_TCP_BACKLOG          511    /* TCP listen backlog. */
 #define PROTO_MAX_QUERYBUF_LEN              (1024*1024*1024) /* 1GB max query buffer. */
 #define PROTO_IOBUF_LEN                     (1024*16)  /* Generic I/O buffer size */
+#define PROTO_REPLY_CHUNK_BYTES             (16*1024) /* 16k output buffer */
+#define NET_MAX_WRITES_PER_EVENT            (1024*64)
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
@@ -137,6 +140,7 @@ struct aeEventLoop;
 typedef void aeFileProc(struct aeEventLoop *eventLoop, int fd, void *clientData, int mask);
 typedef int aeTimeProc(struct aeEventLoop *eventLoop, long long id, void *clientData);
 typedef void aeEventFinalizerProc(struct aeEventLoop *eventLoop, void *clientData);
+typedef void aeBeforeSleepProc(struct aeEventLoop *eventLoop);
 
 typedef struct Client {
     int fd;                 /* socket file handle */
@@ -145,6 +149,10 @@ typedef struct Client {
     bool isonline;          /* Determine whether the client is online */
     time_t ctime;           /* Client creation time. */
     struct list_head list;
+    /* Response buffer */
+    size_t sentlen;         /* Amount of bytes already sent in the current*/
+    int bufpos;
+    char buf[PROTO_REPLY_CHUNK_BYTES];
 } Client;
 
 typedef struct Lamp {
@@ -199,6 +207,7 @@ typedef struct aeEventLoop {
     aeFileEvent *events; /* Registered events */
     aeFiredEvent *fired; /* Fired events */
     aeTimeEvent *timeEventHead;
+    aeBeforeSleepProc *beforesleep;
 } aeEventLoop;
 
 struct Server {
@@ -211,6 +220,7 @@ struct Server {
     int tcpkeepalive;       /* Set SO_KEEPALIVE if non-zero. */
     char *logfile;          /* Path of log file */
     struct list_head clist; /* List of client*/
+    struct list_head clients_pending_write; /* There is to write or install handler. */
     uint32_t clist_size;    /* number of client */
     struct list_head lamplist; /* List of lamp */
     uint32_t lamp_size;     /* number of lamp */
@@ -226,6 +236,13 @@ static int sdSendUdpPage(const char *msg);
 static char *zstrdup(const char *s);
 static void sdLampInit(void);
 static void showLamplist(void);
+static int writeToClient(Client *c, int handler_installed);
+static int handleClientsWithPendingWrites(void);
+static void addReplyString(Client *c, const char *s, size_t len);
+static int apiCommand(Client *c);
+
+
+/*********************************LOG*********************************/
 
 static void sLogRaw(int level, const char *msg) {
     const char *c = ".-*#@";
@@ -389,6 +406,10 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
 // static char *aeApiName(void) {
 //     return "epoll";
 // }
+
+static void aeSetBeforeSleepProc(aeEventLoop *eventLoop, aeBeforeSleepProc *beforesleep) {
+    eventLoop->beforesleep = beforesleep;
+}
 
 static aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
@@ -765,6 +786,8 @@ static int aeProcessEvents(aeEventLoop *eventLoop, int flags)
 void aeMain(aeEventLoop *eventLoop) {
     eventLoop->stop = 0;
     while (!eventLoop->stop) {
+        if (eventLoop->beforesleep != NULL)
+            eventLoop->beforesleep(eventLoop);
         aeProcessEvents(eventLoop, AE_ALL_EVENTS|AE_CALL_AFTER_SLEEP);
     }
 }
@@ -1086,6 +1109,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     return 0;
 }
 
+void beforeSleep(struct aeEventLoop *eventLoop) {
+    AE_NOTUSED(eventLoop);
+
+    /* Handle writes with pending output buffers. */
+    handleClientsWithPendingWrites();
+}
+
 void sdInitServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -1093,6 +1123,7 @@ void sdInitServer(void) {
 
     INIT_LIST_HEAD(&sdserver.clist);
     INIT_LIST_HEAD(&sdserver.lamplist);
+    INIT_LIST_HEAD(&sdserver.clients_pending_write);
     sdserver.tcpport = SD_DEFAULT_TPORT;
     sdserver.clist_size = 0;
     sdserver.lamp_size = 0;
@@ -1202,9 +1233,20 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
      * \0 terminator will be added at the end to ensure the integrity of the data. */
     c->querybuf[qblen+nread] = '\0';
 
+    /* Start parsing commands */
+    apiCommand(c);
+
     // printf("%s\n", c->querybuf);
-    serverLog(LL_NOTICE, "data length: %lu", c->len);
-    sdSendUdpPage("A0001");
+    // serverLog(LL_NOTICE, "data length: %lu", c->len);
+    // sdSendUdpPage("A0001");
+    // char *p = "yrb12222222222222222222222222222222222222222777777777777777777123e";
+    // addReplyString(c, p, strlen(p));
+    // char *p2 = "12455";
+    // addReplyString(c, p2, strlen(p2));
+
+    // p2 = "dfsdfsdfdsfdsfdsfdsfsdfjjjjjjjjjjjjjjjj";
+    // addReplyString(c, p2, strlen(p2));
+    // addReplyString(c,"\r\n",2);
 }
 
 static Client *createClient(int fd) {
@@ -1232,6 +1274,8 @@ static Client *createClient(int fd) {
     c->isonline = true;
     c->querybuf = NULL;
     c->len = 0;
+    c->bufpos = 0;
+    c->sentlen = 0;
     list_add(&c->list, &sdserver.clist);
     sdserver.clist_size++;
 
@@ -1250,6 +1294,128 @@ static void freeClient(Client *c) {
     if (c->querybuf != NULL) free(c->querybuf);
     free(c);
     sdserver.clist_size--;
+}
+
+/* Write event handler. Just send data to the client. */
+void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask) {
+    AE_NOTUSED(el);
+    AE_NOTUSED(mask);
+    writeToClient(privdata, 1);
+}
+
+/* Write data in output buffers to client. Return C_OK if the client
+ * is still valid after the call, C_ERR if it was freed. */
+static int writeToClient(Client *c, int handler_installed) {
+    ssize_t nwritten = 0, totwritten = 0;
+
+    while (c->bufpos != 0) {
+        if (c->bufpos > 0) {
+            nwritten = write(c->fd, c->buf+c->sentlen, c->bufpos-c->sentlen);
+            if (nwritten <= 0) break;
+            c->sentlen += nwritten;
+            totwritten += nwritten;
+
+            /* If the buffer was sent, set bufpos to zero to continue with
+             * the remainder of the reply. */
+            if ((int)c->sentlen == c->bufpos) {
+                c->bufpos = 0;
+                c->sentlen = 0;
+            }
+        } else {
+            /* Note that we avoid to send more than NET_MAX_WRITES_PER_EVENT
+             * bytes, in a single threaded server it's a good idea to serve
+             * other clients as well */
+            if (totwritten > NET_MAX_WRITES_PER_EVENT) {
+                serverLog(LL_WARNING, "Send data larger than 16k");
+                break;
+            }
+        }
+    }
+
+    if (nwritten == -1) {
+        if (errno == EAGAIN) {
+            nwritten = 0;
+        } else {
+            serverLog(LL_VERBOSE,
+                "Error writing to client: %s", strerror(errno));
+            freeClient(c);
+            return C_ERR;
+        }
+    }
+
+    if (c->bufpos != 0) {
+        c->sentlen = 0;
+        if (handler_installed) aeDeleteFileEvent(sdserver.el, c->fd, AE_WRITABLE);
+        freeClient(c);
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* This function is called just before entering the event loop, in the hope
+ * we can just write the replies to the client output buffer without any
+ * need to use a syscall in order to install the writable event handler,
+ * get it called, and so forth. */
+static int handleClientsWithPendingWrites(void) {
+    Client *c, *t;
+
+    list_for_each_entry_safe(c, t, &sdserver.clients_pending_write, list)
+    {
+        /* Try to write buffers to the client socket. */
+        if (writeToClient(c, 0) == C_ERR) continue;
+
+        /* Connect the client to the record list */
+        list_del(&c->list);
+        list_add(&c->list, &sdserver.clist);
+
+        /* If after the synchronous writes above we still have data to
+         * output to the client, we need to install the writable handler. */
+        if (c->bufpos != 0) {
+            if (aeCreateFileEvent(sdserver.el, c->fd, AE_WRITABLE,
+                sendReplyToClient, c) == AE_ERR) {
+                freeClient(c);
+            }
+        }
+    }
+    return 0;
+}
+
+static int prepareClientToWrite(Client *c) {
+    if (c->fd <= 0) return C_ERR;
+
+    /* Schedule the client to write the output buffers to the socket, unless
+     * it should already be setup to do so (it has already pending data). */
+    if (c->bufpos == 0) {
+        /* Add to reply list */
+        list_del(&c->list);
+        list_add(&c->list, &sdserver.clients_pending_write);
+    }
+    /* Authorize the caller to queue in the output buffer of this client. */
+    return C_OK;
+}
+
+/* Low level functions to add more data to output buffers. */
+static int _addReplyToBuffer(Client *c, const char *s, size_t len) {
+    size_t available = sizeof(c->buf)-c->bufpos;
+
+    /* Check that the buffer has enough space available for this string. */
+    if (len > available) return C_ERR;
+
+    memcpy(c->buf+c->bufpos, s, len);
+    c->bufpos += len;
+    return C_OK;
+}
+
+/* This low level function just adds whatever protocol you send it to the
+ * client buffer, trying the static buffer initially, and using the string
+ * of objects if not possible.
+ */
+static void addReplyString(Client *c, const char *s, size_t len) {
+    if (prepareClientToWrite(c) != C_OK) return;
+    if (_addReplyToBuffer(c,s,len) != C_OK) {
+        serverLog(LL_WARNING, "Add Reply Error");
+        return;
+    }
 }
 
 /******************************LAMP**************************************/
@@ -1318,6 +1484,137 @@ static void sdLampInit(void) {
         (void)createLamp(zstrdup(open), zstrdup(close));
     }
     fclose(fp);
+}
+
+#define DEFAULT_LAMP_MTIME 2000  //2s
+static int SetLamp(uint16_t id, uint16_t act, long long mt) {
+    int flag = 0;
+    Lamp *lp;
+    Lamp *t;
+
+    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
+    {
+        if (lp->id == id) {
+            flag = 1;
+            /* The light is on */
+            if (lp->isopen) {
+                if (act > 0) {
+                    /* Update duration */
+                    if (mt > 0) {
+                        lp->starttime = mstime();
+                        lp->mtime = mt;
+                    }
+                    serverLog(LL_DEBUG, "The light (%hu) is already on", lp->id);
+                } else {
+                    /* Set the light to be off, and the light is currently on*/
+                    lp->isopen = false;
+                    /* turn off lights */
+                    serverLog(LL_DEBUG, "Turn off the light (%hu)", lp->id);
+                    sdSendUdpPage(lp->close);
+                }
+            } else {
+                /* The light is off */
+                if (act > 0) {
+                    /* Set the light to be turned on, 
+                     * and the current state of the light is off*/
+                    lp->isopen = true;
+                    lp->starttime = mstime();
+                    lp->mtime = (mt > 0 ? mt : DEFAULT_LAMP_MTIME);
+
+                    /* turn on the light */
+                    serverLog(LL_DEBUG, "Turn on the light (%hu)", lp->id);
+                    sdSendUdpPage(lp->open);
+                } else {
+                    serverLog(LL_DEBUG, "The light (%hu) is already off", lp->id);
+                }
+            }
+            break;
+        }
+    }
+    return  flag ? C_OK : C_ERR;
+}
+
+/*******************************API*************************************/
+const char *json_template = "{\"code\": \"%s\", \"describe\": \"%s (%" PRIu16 ") %s\"}";
+static int apiSet(Client *c, cJSON *root) {
+    uint16_t idx, act;
+    long long mt;
+    cJSON *lamp, *id, *action, *mtime;
+    char buf[512] = {0};
+
+    lamp = cJSON_GetObjectItemCaseSensitive(root, "lamp");
+    if (cJSON_IsObject(lamp)) {
+        id = cJSON_GetObjectItemCaseSensitive(lamp, "id");
+        if (cJSON_IsNumber(id)) {
+            idx = id->valueint;
+        } else {
+            serverLog(LL_DEBUG, "The json data format is incorrect, id is not a number.");
+            goto err;
+        }
+
+        action = cJSON_GetObjectItemCaseSensitive(lamp, "action");
+        if (cJSON_IsNumber(action)) {
+            act = action->valueint;
+        } else {
+            serverLog(LL_DEBUG, "The json data format is incorrect, action is not a number.");
+            goto err;
+        }
+
+        mtime = cJSON_GetObjectItemCaseSensitive(lamp, "mtime");
+        if (cJSON_IsNumber(action)) {
+            mt = mtime->valueint*1000;
+        } else {
+            serverLog(LL_DEBUG, "The json data format is incorrect, mtime is not a number.");
+            goto err;
+        }
+    } else {
+        goto err;
+    }
+
+    if (SetLamp(idx, act, mt) == C_OK) {
+        snprintf(buf, sizeof(buf), json_template, "OK", act > 0 ? "Open" : "Close", idx, ", OK");
+    } else {
+        snprintf(buf, sizeof(buf), json_template, "FAILED", 
+            act > 0 ? "Failed Open" : "Failed Close", idx, ", ERROR");
+    }
+
+    /* Send reply message to client */
+    addReplyString(c, buf, strlen(buf));
+    return C_OK;
+err:
+    return C_ERR;
+}
+
+static int apiCommand(Client *c) {
+    cJSON *root = NULL;
+    cJSON *method;
+
+    root = cJSON_ParseWithLength(c->querybuf, c->len);
+    if (root == NULL) {
+        serverLog(LL_DEBUG, "Json Parser Error (%s)", c->querybuf);
+        goto err;
+    }
+
+    method = cJSON_GetObjectItemCaseSensitive(root, "method");
+    if (cJSON_IsString(method) && (method->valuestring != NULL)) {
+        if (strncasecmp(method->valuestring, "set", 3) == 0) {
+            apiSet(c, root);
+        } else if (strncasecmp(method->valuestring, "get", 3) == 0) {
+
+        } else {
+            serverLog(LL_DEBUG, "The json data format is incorrect The value of the method node is not ‘get’ or ‘set’");
+            goto err;
+        }
+    } else {
+        serverLog(LL_DEBUG, "The json data format is incorrect and the method node does not exist.");
+        goto err;
+    }
+
+    cJSON_Delete(root);
+    return C_OK;
+err:
+    if (root) cJSON_Delete(root);
+    return C_ERR;
 }
 
 /*******************************UDP*************************************/
@@ -1413,6 +1710,7 @@ int main(int argc, char *argv[]) {
     tzset();
 
     sdInitServer();
+    aeSetBeforeSleepProc(sdserver.el, beforeSleep);
     aeMain(sdserver.el);
     aeDeleteEventLoop(sdserver.el);
     
