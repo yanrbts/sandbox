@@ -1193,28 +1193,39 @@ static void loadConfigFile(void) {
 
     fp = fopen(sdserver.configfile, "r");
     if (fp == NULL) {
-        serverLog(LL_DEBUG, "Error open config file");
+        fprintf(stderr, "Error open config file");
         exit(1);
     }
 
     while (fgets(buf, sizeof(buf), fp) != NULL) {
         char *p = buf;
         /* Remove whitespace characters at the beginning of the line */
-        while (*p == ' ' || *p == '\t')
+        while (isspace(*p))
             p++;
         /* Skip lines starting with # */
-        if (p[0] == '#' || p[0] == '\0')
+        if (*p == '#' || *p == '\0')
             continue;
         
         /* Remove newlines at the end of lines */
         p[strcspn(p, "\n")] = '\0';
 
-        char *first = strtok(p, " ");
+        char *first = p;
+        char *second = NULL;
 
-        /* Use strtok to extract the second non-empty string */
-        char *second = strtok(NULL, " ");
-        while (second && *second == '\0')
-            second = strtok(NULL, " ");
+        while (*p && !isspace(*p))
+            p++;
+        if (*p) {
+            *p = '\0';
+            second = p+1;
+        }
+
+        while (second && isspace(*second))
+            second++;
+
+        if (!first || !second) {
+            fprintf(stderr, "Error: Invalid config line or missing parameter.\n");
+            continue;
+        }
 
         if (!strcasecmp(first, "tcpport")) {
             sdserver.tcpport = atoi(second);
@@ -1280,7 +1291,7 @@ void sdInitServer(void) {
     sdserver.clist_size = 0;
     sdserver.lamp_size = 0;
     sdserver.logfile = zstrdup("");
-    sdserver.udpip = "192.168.1.18";
+    sdserver.udpip = zstrdup("");
     sdserver.tcpip = NULL;
     sdserver.udpport = 1000;
     sdserver.tcpkeepalive = CONFIG_DEFAULT_TCP_KEEPALIVE;
@@ -1288,7 +1299,8 @@ void sdInitServer(void) {
     sdserver.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
     sdserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
 
-    
+    loadConfigFile();
+
     sdserver.el = aeCreateEventLoop(1024);
     if (sdserver.el == NULL) {
         serverLog(LL_WARNING,
@@ -1304,7 +1316,8 @@ void sdInitServer(void) {
     (void)getServerIp(sdserver.ipfd);
     printf(ascii_logo, SD_VERSION, (long)getpid(), sdserver.tcpip, sdserver.tcpport, sdserver.udpip, sdserver.udpport);
     serverLog(LL_WARNING,"IPv4: supproted");
-    sdLampInit();
+    // sdLampInit();
+    
     showLamplist();
 
     /* Create the timer callback, this is our way to process many background
