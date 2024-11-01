@@ -78,6 +78,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <inttypes.h>
+#include <getopt.h>
 #include "list.h"
 #include "cJSON.h"
 
@@ -121,6 +122,7 @@
 #define ANET_ERR_LEN 256
 #define NET_IP_STR_LEN 46 /* INET6_ADDRSTRLEN is 46, but we need to be sure */
 
+#define SD_VERSION "1.0.0"
 #define CONFIG_DEFAULT_TCP_KEEPALIVE        300
 #define CONFIG_DEFAULT_TCP_BACKLOG          511    /* TCP listen backlog. */
 #define PROTO_MAX_QUERYBUF_LEN              (1024*1024*1024) /* 1GB max query buffer. */
@@ -128,6 +130,7 @@
 #define PROTO_REPLY_CHUNK_BYTES             (16*1024) /* 16k output buffer */
 #define NET_MAX_WRITES_PER_EVENT            (1024*64)
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
+#define CONFIG_READ_LEN                     1024
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
@@ -212,7 +215,9 @@ typedef struct aeEventLoop {
 
 struct Server {
     char *configfile;       /* config file path */
+    int daemonize;          /* True if running as a daemon */
     char *udpip;            /* Sandbox router address*/
+    char *tcpip;            /* TCP address*/
     uint32_t udpport;       /* Sandbox router port */
     uint32_t tcpport;       /* Server Tcp Port */
     int ipfd;               /* TCP socket file descriptors */
@@ -234,12 +239,29 @@ static void freeClient(Client *c);
 static void setupSignalHandlers(void);
 static int sdSendUdpPage(const char *msg);
 static char *zstrdup(const char *s);
+static Lamp *createLamp(char *op, char *cl);
 static void sdLampInit(void);
 static void showLamplist(void);
+static int getServerIp(int s);
 static int writeToClient(Client *c, int handler_installed);
 static int handleClientsWithPendingWrites(void);
 static void addReplyString(Client *c, const char *s, size_t len);
 static int apiCommand(Client *c);
+
+/********************************LOGO*********************************/
+
+static const char *ascii_logo =                           
+"               _ _       _   _     \n"  
+" ___ ___ ___ _| | |_ ___| |_| |___ \n"
+"|_ -| .'|   | . |  _| .'| . | | -_|\n"
+"|___|__,|_|_|___|_| |__,|___|_|___|\n\n"
+"        version: %-10s\n"
+"        PID: %ld\n"
+"        tcp: %s:%d\n"
+"        udp: %s:%d\n"
+"        author: yanruibing\n\n";
+                                   
+
 
 
 /*********************************LOG*********************************/
@@ -1008,6 +1030,32 @@ int anetTcpAccept(int s, char *ip, size_t ip_len, int *port) {
     return fd;
 }
 
+static int getServerIp(int s) {
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+    char ipstr[INET6_ADDRSTRLEN];
+
+    addr_len = sizeof(addr);
+    if (getsockname(s, (struct sockaddr*)&addr, &addr_len) == -1) {
+        serverLog(LL_DEBUG, "getsockname failed: %s", strerror(errno));
+        goto err;
+    }
+
+    if (addr.ss_family == AF_INET) {
+        struct sockaddr_in *ipv4 = (struct sockaddr_in *)&addr;
+        inet_ntop(AF_INET, &ipv4->sin_addr, ipstr, sizeof(ipstr));
+    } else if (addr.ss_family == AF_INET6) {
+        struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)&addr;
+        inet_ntop(AF_INET6, &ipv6->sin6_addr, ipstr, sizeof(ipstr));
+    }
+
+    sdserver.tcpip = zstrdup(ipstr);
+
+    return C_OK;
+err:
+    return C_ERR;
+}
+
 /* Initialize a set of file descriptors to listen to the specified 'port'
  * binding the addresses specified in the server configuration.
  *
@@ -1023,7 +1071,7 @@ int anetTcpAccept(int s, char *ip, size_t ip_len, int *port) {
  * configuration but the function is not able to bind * for at least
  * one of the IPv4 or IPv6 protocols. */
 int listenToPort(int port, int *fd) {
-    int unsupported = 0;
+    // int unsupported = 0;
 
     // *fd = anetTcp6Server(port, NULL, sdserver.tcp_backlog);
     // if (*fd != ANET_ERR) {
@@ -1039,9 +1087,8 @@ int listenToPort(int port, int *fd) {
         *fd = anetTcpServer(port, NULL, sdserver.tcp_backlog);
         if (*fd != ANET_ERR) {
             anetNonBlock(*fd);
-            serverLog(LL_WARNING,"IPv4: supproted");
         } else if (errno == EAFNOSUPPORT) {
-            unsupported++;
+            // unsupported++;
             serverLog(LL_WARNING,"Not listening to IPv4: unsupproted");
             return C_ERR;
         }
@@ -1131,6 +1178,96 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     handleClientsWithPendingWrites();
 }
 
+static int yesnotoi(char *s) {
+    if (!strcasecmp(s,"yes")) return 1;
+    else if (!strcasecmp(s,"no")) return 0;
+    else return -1;
+}
+
+static void loadConfigFile(void) {
+    FILE *fp;
+    FILE *logfp;
+    char *err = NULL;
+    char tmp[256] = {0};
+    char buf[CONFIG_READ_LEN+1];
+
+    fp = fopen(sdserver.configfile, "r");
+    if (fp == NULL) {
+        serverLog(LL_DEBUG, "Error open config file");
+        exit(1);
+    }
+
+    while (fgets(buf, sizeof(buf), fp) != NULL) {
+        char *p = buf;
+        /* Remove whitespace characters at the beginning of the line */
+        while (*p == ' ' || *p == '\t')
+            p++;
+        /* Skip lines starting with # */
+        if (p[0] == '#' || p[0] == '\0')
+            continue;
+        
+        /* Remove newlines at the end of lines */
+        p[strcspn(p, "\n")] = '\0';
+
+        char *first = strtok(p, " ");
+
+        /* Use strtok to extract the second non-empty string */
+        char *second = strtok(NULL, " ");
+        while (second && *second == '\0')
+            second = strtok(NULL, " ");
+
+        if (!strcasecmp(first, "tcpport")) {
+            sdserver.tcpport = atoi(second);
+            if (sdserver.tcpport < 0 || sdserver.tcpport > 65535) {
+                err = "Invalid port"; goto loaderr;
+            }
+        } else if (!strcasecmp(first, "udpip")) {
+            free(sdserver.udpip);
+            sdserver.udpip = zstrdup(second);
+        } else if (!strcasecmp(first, "udpport")) {
+            sdserver.udpport = atoi(second);
+            if (sdserver.udpport < 0 || sdserver.udpport > 65535) {
+                err = "Invalid UDP port"; goto loaderr;
+            }
+        } else if (!strcasecmp(first, "tcp-backlog")) {
+            sdserver.tcp_backlog = atoi(second);
+            if (sdserver.tcp_backlog < 0) {
+                err = "Invalid backlog value"; goto loaderr;
+            }
+        } else if (!strcasecmp(first, "tcp-keepalive")) {
+            sdserver.tcpkeepalive = atoi(second);
+            if (sdserver.tcpkeepalive < 0) {
+                err = "Invalid tcp-keepalive value"; goto loaderr;
+            }
+        } else if (!strcasecmp(first, "logfile")) {
+            free(sdserver.logfile);
+            sdserver.logfile = zstrdup(second);
+            if (sdserver.logfile[0] != '\0') {
+                /* Test if we are able to open the file. The server will not
+                 * be able to abort just for this problem later... */
+                logfp = fopen(sdserver.logfile,"a");
+                if (logfp == NULL) {
+                    snprintf(tmp, sizeof(tmp), "Can't open the log file: %s", strerror(errno));
+                    err = tmp;
+                    goto loaderr;
+                }
+                fclose(logfp);
+            }
+        } else if (!strcasecmp(first, "daemonize")) {
+            if ((sdserver.daemonize = yesnotoi(second)) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+        } else {
+            (void)createLamp(zstrdup(first), zstrdup(second));
+        }
+    }
+    fclose(fp);
+    return;
+loaderr:
+    fprintf(stderr, "%s\n", err);
+    exit(1);
+}
+
 void sdInitServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
@@ -1144,13 +1281,14 @@ void sdInitServer(void) {
     sdserver.lamp_size = 0;
     sdserver.logfile = zstrdup("");
     sdserver.udpip = "192.168.1.18";
+    sdserver.tcpip = NULL;
     sdserver.udpport = 1000;
     sdserver.tcpkeepalive = CONFIG_DEFAULT_TCP_KEEPALIVE;
     sdserver.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     sdserver.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
     sdserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
-    sdLampInit();
-    showLamplist();
+
+    
     sdserver.el = aeCreateEventLoop(1024);
     if (sdserver.el == NULL) {
         serverLog(LL_WARNING,
@@ -1162,7 +1300,13 @@ void sdInitServer(void) {
     /* Open the TCP listening socket for the user commands. */
     if (sdserver.tcpport != 0 && listenToPort(sdserver.tcpport, &sdserver.ipfd) == C_ERR)
         exit(1);
-    
+
+    (void)getServerIp(sdserver.ipfd);
+    printf(ascii_logo, SD_VERSION, (long)getpid(), sdserver.tcpip, sdserver.tcpport, sdserver.udpip, sdserver.udpport);
+    serverLog(LL_WARNING,"IPv4: supproted");
+    sdLampInit();
+    showLamplist();
+
     /* Create the timer callback, this is our way to process many background
      * operations incrementally, like clients timeout, eviction of unaccessed
      * expired keys and so forth. */
@@ -1422,7 +1566,6 @@ static void addReplyString(Client *c, const char *s, size_t len) {
 }
 
 /******************************LAMP**************************************/
-#define CONFIG_READ_LEN 1024
 static inline uint16_t lamp_index(const char *s) {
     uint16_t idx = 0;
     sscanf(s, "%*[^0-9]%hu", &idx);
@@ -1487,7 +1630,7 @@ static void sdLampInit(void) {
         while (*p == ' ' || *p == '\t')
             p++;
         /* Skip lines starting with # */
-        if (p[0] == '#')
+        if (p[0] == '#' || p[0] == '\0')
             continue;
         
         /* Remove newlines at the end of lines */
@@ -1502,14 +1645,16 @@ static void sdLampInit(void) {
 }
 
 #define DEFAULT_LAMP_MTIME 2000  //2s
-static int SetLamp(uint16_t id, uint16_t act, long long mt) {
+static int SetSingleLamp(uint16_t id, uint16_t act, long long mt) {
     int flag = 0;
     Lamp *lp;
     Lamp *t;
 
     list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
     {
-        if (lp->id == id) {
+        /* When id is 0, process all lights, 
+         * otherwise only process matching lights */
+        if (id != 0 && lp->id == id) {
             flag = 1;
             /* The light is on */
             if (lp->isopen) {
@@ -1549,8 +1694,102 @@ static int SetLamp(uint16_t id, uint16_t act, long long mt) {
     return  flag ? C_OK : C_ERR;
 }
 
+static int SetAllLamp(uint16_t id, uint16_t act, long long mt) {
+    Lamp *lp;
+    Lamp *t;
+
+    if (id != 0) return C_ERR;
+
+    /* Find the 0th light */
+    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
+        if (act > 0) {
+            lp->isopen = true;
+            lp->starttime = mstime();
+            lp->mtime = (mt > 0 ? mt : DEFAULT_LAMP_MTIME);
+
+            /* If the 0 number is found, send all open commands */
+            if (lp->id == id)
+                sdSendUdpPage(lp->open);
+        } else {
+            lp->isopen = false;
+            lp->starttime = 0;
+            lp->mtime = 0;
+
+            /* If the 0 number is found, send all close commands */
+            if (lp->id == id)
+                sdSendUdpPage(lp->close);
+        }
+    }
+    return  C_OK;
+}
+
+static int SetLamp(uint16_t id, uint16_t act, long long mt) {
+    if (id == 0) {
+        return SetAllLamp(id, act, mt);
+    } else {
+        return SetSingleLamp(id, act, mt);
+    }
+}
+
+/* Search lamp information based on id. If id=0, 
+ * return the information of all lamps. If id!=0, 
+ * return the specific lamp information. If not found, return NULL.*/
+static char *GetLamp(uint16_t id) {
+    Lamp *lp;
+    Lamp *t;
+    cJSON *root = NULL, *lamps, *lamp;
+    char *jstr = NULL;
+
+    if (id == 0) {
+        root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "code", "OK");
+        lamps = cJSON_CreateArray();
+        /* Get all light status */
+        list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
+            lamp = cJSON_CreateObject();
+            cJSON_AddNumberToObject(lamp, "id", lp->id);
+            cJSON_AddNumberToObject(lamp, "status", lp->isopen ? 1 : 0);
+            cJSON_AddNumberToObject(lamp, "mtime", lp->mtime);
+            cJSON_AddItemToArray(lamps, lamp);
+        }
+        cJSON_AddItemToObject(root, "lamps", lamps);
+    } else {
+        list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
+            if (lp->id == id) {
+                root = cJSON_CreateObject();
+                cJSON_AddStringToObject(root, "code", "OK");
+                lamps = cJSON_CreateArray();
+
+                lamp = cJSON_CreateObject();
+                cJSON_AddNumberToObject(lamp, "id", lp->id);
+                cJSON_AddNumberToObject(lamp, "status", lp->isopen ? 1 : 0);
+                cJSON_AddNumberToObject(lamp, "mtime", lp->mtime);
+                cJSON_AddItemToArray(lamps, lamp);
+
+                cJSON_AddItemToObject(root, "lamps", lamps);
+                break;
+            }
+        }
+    }
+    
+    if (root)
+        jstr = cJSON_PrintUnformatted(root);
+
+    if (root) cJSON_Delete(root);
+    return jstr;
+}
+
 /*******************************API*************************************/
 const char *json_template = "{\"code\": \"%s\", \"describe\": \"%s (%" PRIu16 ") %s\"}";
+const char *error_template = "{\"code\": \"%s\", \"describe\": \"%s\"}";
+
+static inline void sendErrorReply(Client *c, const char *s) {
+    char buf[1024] = {0};
+    serverLog(LL_DEBUG, s);
+    snprintf(buf, sizeof(buf), error_template, "FAILED", s);
+    addReplyString(c, buf, strlen(buf));
+}
+
 static int apiSet(Client *c, cJSON *root) {
     uint16_t idx, act;
     long long mt;
@@ -1563,7 +1802,7 @@ static int apiSet(Client *c, cJSON *root) {
         if (cJSON_IsNumber(id)) {
             idx = id->valueint;
         } else {
-            serverLog(LL_DEBUG, "The json data format is incorrect, id is not a number.");
+            sendErrorReply(c, "The json data format is incorrect, id is not a number.");
             goto err;
         }
 
@@ -1571,7 +1810,7 @@ static int apiSet(Client *c, cJSON *root) {
         if (cJSON_IsNumber(action)) {
             act = action->valueint;
         } else {
-            serverLog(LL_DEBUG, "The json data format is incorrect, action is not a number.");
+            sendErrorReply(c, "The json data format is incorrect, action is not a number.");
             goto err;
         }
 
@@ -1580,10 +1819,11 @@ static int apiSet(Client *c, cJSON *root) {
         if (cJSON_IsNumber(action)) {
             mt = mtime->valueint*1000;
         } else {
-            serverLog(LL_DEBUG, "The json data format is incorrect, mtime is not a number.");
+            sendErrorReply(c, "The json data format is incorrect, mtime is not a number.");
             goto err;
         }
     } else {
+        sendErrorReply(c, "The json data format is incorrect, lamp node does not exist.");
         goto err;
     }
 
@@ -1593,9 +1833,34 @@ static int apiSet(Client *c, cJSON *root) {
         snprintf(buf, sizeof(buf), json_template, "FAILED", 
             act > 0 ? "Failed Open" : "Failed Close", idx, ", ERROR");
     }
-
     /* Send reply message to client */
     addReplyString(c, buf, strlen(buf));
+    return C_OK;
+err:
+    return C_ERR;
+}
+
+static int apiGet(Client *c, cJSON *root) {
+    uint16_t idx;
+    cJSON *id;
+    char *jstr = NULL;
+
+    id = cJSON_GetObjectItemCaseSensitive(root, "id");
+    if (cJSON_IsNumber(id)) {
+        idx = id->valueint;
+    } else {
+        sendErrorReply(c, "The json data format is incorrect, id is not a number.");
+        goto err;
+    }
+
+    if ((jstr = GetLamp(idx)) != NULL) {
+        /* Send reply message to client */
+        addReplyString(c, jstr, strlen(jstr));
+        free(jstr);
+    } else {
+        sendErrorReply(c, "light does not exist");
+        goto err;
+    }
     return C_OK;
 err:
     return C_ERR;
@@ -1616,13 +1881,13 @@ static int apiCommand(Client *c) {
         if (strncasecmp(method->valuestring, "set", 3) == 0) {
             apiSet(c, root);
         } else if (strncasecmp(method->valuestring, "get", 3) == 0) {
-
+            apiGet(c, root);
         } else {
-            serverLog(LL_DEBUG, "The json data format is incorrect The value of the method node is not ‘get’ or ‘set’");
+            sendErrorReply(c, "The json data format is incorrect The value of the method node is not ‘get’ or ‘set’");
             goto err;
         }
     } else {
-        serverLog(LL_DEBUG, "The json data format is incorrect and the method node does not exist.");
+        sendErrorReply(c, "The json data format is incorrect and the method node does not exist.");
         goto err;
     }
 
@@ -1694,9 +1959,9 @@ static void sigShutdownHandler(int sig) {
         aeStop(sdserver.el);
         exit(1); /* Exit with an error since this was not a clean shutdown. */
     } else {
+        serverLog(LL_WARNING, msg);
         exit(0);
     }
-    serverLog(LL_WARNING, msg);
 }
 
 static void setupSignalHandlers(void) {
@@ -1707,10 +1972,41 @@ static void setupSignalHandlers(void) {
     sigemptyset(&act.sa_mask);
     act.sa_flags = 0;
     act.sa_handler = sigShutdownHandler;
+    /* This is the termination signal sent by the kill(1) command by default.
+     * Because it can be caught by applications, using SIGTERM gives programs
+     * a chance to terminate gracefully by cleaning up before exiting */
     sigaction(SIGTERM, &act, NULL);
+    /* This signal is generated by the terminal driver when we press the
+     * interrupt key (often DELETE or Control-C). This signal is sent to all
+     * processes in the foreground process group . This
+     * signal is often used to terminate a runaway program, especially when it’s
+     * generating a lot of unwanted output on the screen.*/
     sigaction(SIGINT, &act, NULL);
     return;
 }
+
+/****************************HELP*****************************/
+
+static void usage() {
+    printf ("\nUsage: [OPTION]... \n"
+                "OPTIONS:\n\n"
+                "  -p,              Server port(The default is 8899).\n"
+                "  -l,              Log file (If not set it will be displayed on the screen).\n"
+                "  -s,              Sand table address.\n"
+                "  -u,              Sand table UDP port.\n"
+                "  -f,              Sand table configuration file.\n"
+                "  -b,              Whether to daemonize.\n"
+                "      --help       display this help and exit.\n"
+                "      --version    output version information and exit.\n\n"
+                "Examples:\n"
+                "  sandbox -p 8899 -f log.txt -s 192.168.1.18 -u 1000\n\n");
+}
+
+static struct option const long_options[] = {
+    {"version", no_argument, NULL, 'v'},
+    {"help", no_argument, NULL, 'h'},
+    {NULL, no_argument, NULL, 0}
+};
 
 int main(int argc, char *argv[]) {
     /* The setlocale() function is used to set or query the program's current locale.
@@ -1725,7 +2021,7 @@ int main(int argc, char *argv[]) {
      * This function is automati‐cally called by the other time conversion functions 
      * that depend on the timezone.*/
     tzset();
-
+    
     sdInitServer();
     aeSetBeforeSleepProc(sdserver.el, beforeSleep);
     aeMain(sdserver.el);

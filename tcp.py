@@ -227,9 +227,9 @@ def connect_to_tcp_server(host='localhost', port=8899):
     data = {
         "method": "set",
         "lamp": {
-            "id": 2,
+            "id": 1,
             "action": 1,
-            "mtime": 20
+            "mtime": 400
         }
     }
     json_data = json.dumps(data)
