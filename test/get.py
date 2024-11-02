@@ -6,7 +6,7 @@ def connect_to_tcp_server(host='localhost', port=8899):
     # 创建一个复杂的结构化 JSON 数据
     data = {
         "method": "get",
-        "id": 2
+        "id": 0
     }
     json_data = json.dumps(data)
 

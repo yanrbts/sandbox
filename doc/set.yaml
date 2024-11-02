@@ -1,0 +1,68 @@
+title: Lamp Control TCP Protocol
+description: Protocol for setting and receiving lamp control status over TCP
+version: 1.0.0
+
+components:
+  schemas:
+    SetLampRequest:
+      type: object
+      description: Request structure to set lamp status
+      properties:
+        method:
+          type: string
+          example: "set"
+          description: "Request method to specify action"
+        lamp:
+          type: object
+          description: "Lamp control settings"
+          properties:
+            id:
+              type: integer
+              example: 1
+              description: "Lamp ID"
+            action:
+              type: integer
+              example: 1
+              description: "Action to take, 1 for on, 0 for off"
+            mtime:
+              type: integer
+              example: 1000
+              description: "Time in milliseconds for the lamp to remain active"
+          required:
+            - id
+            - action
+            - mtime
+      required:
+        - method
+        - lamp
+
+    SetLampResponse:
+      type: object
+      description: Response structure for lamp control actions
+      properties:
+        code:
+          type: string
+          example: "OK"
+          description: "Response code indicating success or failure"
+        describe:
+          type: string
+          example: "Open successfully"
+          description: "Description of the result of the request"
+      required:
+        - code
+        - describe
+
+tcpProtocol:
+  setRequest:
+    description: "JSON structure for setting lamp status"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/SetLampRequest'
+
+  setResponse:
+    description: "JSON structure for responding to lamp status set request"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/SetLampResponse'

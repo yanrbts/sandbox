@@ -1,29 +1,27 @@
-# Makefile to compile all .c files in the current directory into sandbox executable
-
-# 编译器
+# 定义变量
 CC = gcc
+CFLAGS = -Wall -Wno-unused-function -I./src
+SRCDIR = src
+OBJDIR = obj
+TARGET = sandtable
 
-# 编译选项
-CFLAGS = -Wall -g
+# 搜索 src 目录下的所有 .c 文件
+SOURCES := $(wildcard $(SRCDIR)/*.c)
+OBJECTS := $(patsubst $(SRCDIR)/%.c, $(OBJDIR)/%.o, $(SOURCES))
 
-# 目标程序名
-TARGET = sandbox
+# 目标规则：生成可执行文件 sandtable
+$(TARGET): $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS)
 
-# 查找所有 .c 文件和 .h 文件
-SRC = $(wildcard *.c)
-OBJ = $(SRC:.c=.o)
-
-# 目标规则
-$(TARGET): $(OBJ)
-	$(CC) $(CFLAGS) -o $@ $(OBJ)
-
-# 自动生成 .o 文件规则
-%.o: %.c
+# 创建 obj 目录并编译 .c 文件
+$(OBJDIR)/%.o: $(SRCDIR)/%.c | $(OBJDIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# 清理目标
-clean:
-	rm -f $(OBJ) $(TARGET)
+# 创建 obj 目录
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
 
-# 伪目标（不生成文件）
+# 清理编译生成的文件
 .PHONY: clean
+clean:
+	rm -rf $(OBJDIR) $(TARGET)

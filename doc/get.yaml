@@ -1,0 +1,87 @@
+title: Lamp Control TCP Protocol
+description: Protocol for requesting and receiving lamp status data over TCP
+version: 1.0.0
+
+components:
+  schemas:
+    LampRequest:
+      type: object
+      description: Request structure for lamp status
+      properties:
+        method:
+          type: string
+          example: "get"
+          description: "Request method to specify action"
+        id:
+          type: integer
+          example: 0
+          description: "Unique request ID"
+      required:
+        - method
+        - id
+
+    LampResponse:
+      type: object
+      description: Response structure containing lamp statuses
+      properties:
+        code:
+          type: string
+          example: "OK"
+          description: "Response code indicating success or failure"
+        lamps:
+          type: array
+          description: "Array of lamp status objects"
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+                example: 1
+                description: "Lamp ID"
+              status:
+                type: integer
+                example: 1
+                description: "Lamp status: 1 for on, 0 for off"
+              mtime:
+                type: integer
+                example: 500
+                description: "Time in milliseconds the lamp has been active"
+        required:
+          - code
+          - lamps
+
+    ErrorResponse:
+      type: object
+      description: Error response structure
+      properties:
+        code:
+          type: string
+          example: "FAIL"
+          description: "Failure status code"
+        message:
+          type: string
+          example: "Invalid request format"
+          describe: "Detailed error message"
+      required:
+        - code
+        - message
+
+tcpProtocol:
+  request:
+    description: "JSON structure for requesting lamp status"
+    content:
+      application/json:
+        schema:
+          $ref: '#/components/schemas/LampRequest'
+
+  response:
+    description: "JSON structure for responding with lamp status or error information"
+    content:
+      application/json:
+        oneOf:
+          - description: "Successful response with lamp statuses"
+            schema:
+              $ref: '#/components/schemas/LampResponse'
+          - description: "Error response with failure information"
+            schema:
+              $ref: '#/components/schemas/ErrorResponse'

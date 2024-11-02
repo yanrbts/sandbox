@@ -59,6 +59,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <locale.h>
 #include <sys/types.h>
 #include <sys/select.h>
@@ -78,7 +79,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <inttypes.h>
-#include <getopt.h>
+#include <ctype.h>
 #include "list.h"
 #include "cJSON.h"
 
@@ -240,7 +241,6 @@ static void setupSignalHandlers(void);
 static int sdSendUdpPage(const char *msg);
 static char *zstrdup(const char *s);
 static Lamp *createLamp(char *op, char *cl);
-static void sdLampInit(void);
 static void showLamplist(void);
 static int getServerIp(int s);
 static int writeToClient(Client *c, int handler_installed);
@@ -324,6 +324,38 @@ static long long ustime(void) {
 
 static long long mstime(void) {
     return ustime()/1000;
+}
+
+/* Given the filename, return the absolute path as an SDS string, or NULL
+ * if it fails for some reason. Note that "filename" may be an absolute path
+ * already, this will be detected and handled correctly.
+ *
+ * The function does not try to normalize everything, but only the obvious
+ * case of one or more "../" appearning at the start of "filename"
+ * relative path. */
+static char *getAbsolutePath(char *filename) {
+    char *ptr = NULL;
+    char absolute_path[PATH_MAX];
+    struct stat st;
+
+    if (stat(filename, &st) != 0) {
+        serverLog(LL_DEBUG, "Error resolving file information");
+        return NULL;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        serverLog(LL_DEBUG, "%s is neither a regular file nor a directory.", filename);
+        return NULL;
+    }
+
+    if (realpath(filename, absolute_path) != NULL) {
+        ptr = zstrdup(absolute_path);
+        printf("abs  : %s\n", ptr);
+        return ptr;
+    } else {
+        serverLog(LL_DEBUG, "Error resolving absolute path");
+        return NULL;
+    }
 }
 
 /*********************************EPOLL*****************************************/
@@ -1279,11 +1311,7 @@ loaderr:
     exit(1);
 }
 
-void sdInitServer(void) {
-    signal(SIGHUP, SIG_IGN);
-    signal(SIGPIPE, SIG_IGN);
-    setupSignalHandlers();
-
+void initServerConfig() {
     INIT_LIST_HEAD(&sdserver.clist);
     INIT_LIST_HEAD(&sdserver.lamplist);
     INIT_LIST_HEAD(&sdserver.clients_pending_write);
@@ -1298,8 +1326,14 @@ void sdInitServer(void) {
     sdserver.tcp_backlog = CONFIG_DEFAULT_TCP_BACKLOG;
     sdserver.client_max_querybuf_len = PROTO_MAX_QUERYBUF_LEN;
     sdserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
+    sdserver.daemonize = 0;
+}
 
-    loadConfigFile();
+void sdInitServer(void) {
+    FILE *fp;
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGPIPE, SIG_IGN);
+    setupSignalHandlers();
 
     sdserver.el = aeCreateEventLoop(1024);
     if (sdserver.el == NULL) {
@@ -1314,10 +1348,15 @@ void sdInitServer(void) {
         exit(1);
 
     (void)getServerIp(sdserver.ipfd);
-    printf(ascii_logo, SD_VERSION, (long)getpid(), sdserver.tcpip, sdserver.tcpport, sdserver.udpip, sdserver.udpport);
-    serverLog(LL_WARNING,"IPv4: supproted");
-    // sdLampInit();
+
+    int log_to_stdout = sdserver.logfile[0] == '\0';
+    fp = log_to_stdout ? stdout : fopen(sdserver.logfile,"a");
+    fprintf(fp, ascii_logo, SD_VERSION, (long)getpid(), 
+        sdserver.tcpip, sdserver.tcpport, sdserver.udpip, sdserver.udpport);
+    fflush(fp);
+    if (!log_to_stdout) fclose(fp);
     
+    serverLog(LL_WARNING,"IPv4: supproted");
     showLamplist();
 
     /* Create the timer callback, this is our way to process many background
@@ -1627,36 +1666,6 @@ static void freeLamp(void) {
     }
 }
 
-static void sdLampInit(void) {
-    FILE *fp;
-    char buf[CONFIG_READ_LEN+1];
-
-    fp = fopen(sdserver.configfile, "r");
-    if (fp == NULL) {
-        serverLog(LL_DEBUG, "Error open config file");
-        exit(1);
-    }
-
-    while (fgets(buf, sizeof(buf), fp) != NULL) {
-        char *p = buf;
-        /* Remove whitespace characters at the beginning of the line */
-        while (*p == ' ' || *p == '\t')
-            p++;
-        /* Skip lines starting with # */
-        if (p[0] == '#' || p[0] == '\0')
-            continue;
-        
-        /* Remove newlines at the end of lines */
-        p[strcspn(p, "\n")] = '\0';
-
-        char *open = strtok(p, " ");
-        char *close = strtok(NULL, " ");
-
-        (void)createLamp(zstrdup(open), zstrdup(close));
-    }
-    fclose(fp);
-}
-
 #define DEFAULT_LAMP_MTIME 2000  //2s
 static int SetSingleLamp(uint16_t id, uint16_t act, long long mt) {
     int flag = 0;
@@ -1759,11 +1768,13 @@ static char *GetLamp(uint16_t id) {
         lamps = cJSON_CreateArray();
         /* Get all light status */
         list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
-            lamp = cJSON_CreateObject();
-            cJSON_AddNumberToObject(lamp, "id", lp->id);
-            cJSON_AddNumberToObject(lamp, "status", lp->isopen ? 1 : 0);
-            cJSON_AddNumberToObject(lamp, "mtime", lp->mtime);
-            cJSON_AddItemToArray(lamps, lamp);
+            if (lp->id != 0) {
+                lamp = cJSON_CreateObject();
+                cJSON_AddNumberToObject(lamp, "id", lp->id);
+                cJSON_AddNumberToObject(lamp, "status", lp->isopen ? 1 : 0);
+                cJSON_AddNumberToObject(lamp, "mtime", lp->mtime);
+                cJSON_AddItemToArray(lamps, lamp);
+            }
         }
         cJSON_AddItemToObject(root, "lamps", lamps);
     } else {
@@ -1998,30 +2009,40 @@ static void setupSignalHandlers(void) {
     return;
 }
 
-/****************************HELP*****************************/
+static void daemonize(void) {
+    int fd;
 
-static void usage() {
-    printf ("\nUsage: [OPTION]... \n"
-                "OPTIONS:\n\n"
-                "  -p,              Server port(The default is 8899).\n"
-                "  -l,              Log file (If not set it will be displayed on the screen).\n"
-                "  -s,              Sand table address.\n"
-                "  -u,              Sand table UDP port.\n"
-                "  -f,              Sand table configuration file.\n"
-                "  -b,              Whether to daemonize.\n"
-                "      --help       display this help and exit.\n"
-                "      --version    output version information and exit.\n\n"
-                "Examples:\n"
-                "  sandbox -p 8899 -f log.txt -s 192.168.1.18 -u 1000\n\n");
+    if (fork() != 0) exit(0); /* parent exits */
+    setsid(); /* create a new session */
+
+    /* Every output goes to /dev/null. If Redis is daemonized but
+     * the 'logfile' is set to 'stdout' in the configuration file
+     * it will not log at all. */
+    if ((fd = open("/dev/null", O_RDWR, 0)) != -1) {
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > STDERR_FILENO) close(fd);
+    }
 }
 
-static struct option const long_options[] = {
-    {"version", no_argument, NULL, 'v'},
-    {"help", no_argument, NULL, 'h'},
-    {NULL, no_argument, NULL, 0}
-};
+static void version(void) {
+    printf("Sandtable server v=%s\n", SD_VERSION);
+    exit(0);
+}
+
+static void usage(void) {
+    fprintf(stderr,"Usage: ./sandtable [/path/to/config.conf]\n");
+    fprintf(stderr,"       ./redis-server -v or --version\n");
+    fprintf(stderr,"       ./redis-server -h or --help\n");
+    fprintf(stderr,"Examples:\n");
+    fprintf(stderr,"       ./sandtable (run the server with default conf)\n");
+    fprintf(stderr,"       ./sandtable /etc/sandtable/config.conf\n");
+    exit(1);
+}
 
 int main(int argc, char *argv[]) {
+    int j;
     /* The setlocale() function is used to set or query the program's current locale.
      * 
      * The function is used to set the current locale of the program and the 
@@ -2034,7 +2055,34 @@ int main(int argc, char *argv[]) {
      * This function is automati‐cally called by the other time conversion functions 
      * that depend on the timezone.*/
     tzset();
-    
+    initServerConfig();
+
+    if (argc >= 2) {
+        j = 1;
+        char *configfile = NULL;
+        char *tp = NULL;
+        /* Handle special options --help and --version */
+        if (strcmp(argv[1], "-v") == 0 ||
+            strcmp(argv[1], "--version") == 0) version();
+        if (strcmp(argv[1], "--help") == 0 ||
+            strcmp(argv[1], "-h") == 0) usage();
+        
+        /* First argument is the config file name? */
+        if (argv[j][0] != '-' || argv[j][1] != '-') {
+            configfile = argv[j];
+            if ((tp = getAbsolutePath(configfile)) != NULL) {
+                free(sdserver.configfile);
+                sdserver.configfile = tp;
+            } else {
+                serverLog(LL_WARNING, "Warning: no config file specified, using the default config.");
+            }
+        }
+    }
+
+    loadConfigFile();
+    if (sdserver.daemonize)
+        daemonize();
+
     sdInitServer();
     aeSetBeforeSleepProc(sdserver.el, beforeSleep);
     aeMain(sdserver.el);

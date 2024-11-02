@@ -1,7 +1,0 @@
-{
-    "code": "OK",
-    "lamps": [
-        {"id": 1, "status": 1, "mtime": 500},
-        {"id": 2, "status": 0, "mtime": 1000}
-    ]
-}
