@@ -350,7 +350,6 @@ static char *getAbsolutePath(char *filename) {
 
     if (realpath(filename, absolute_path) != NULL) {
         ptr = zstrdup(absolute_path);
-        printf("abs  : %s\n", ptr);
         return ptr;
     } else {
         serverLog(LL_DEBUG, "Error resolving absolute path");
