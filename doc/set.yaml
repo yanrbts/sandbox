@@ -19,7 +19,7 @@ components:
             id:
               type: integer
               example: 1
-              description: "Lamp ID"
+              description: "Lamp ID, If it is 0, it means all lights"
             action:
               type: integer
               example: 1

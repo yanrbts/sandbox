@@ -15,7 +15,7 @@ components:
         id:
           type: integer
           example: 0
-          description: "Unique request ID"
+          description: "Unique request ID, If it is 0, it means all lights"
       required:
         - method
         - id
