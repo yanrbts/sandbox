@@ -1033,7 +1033,7 @@ static int anetGenericAccept(int s, struct sockaddr *sa, socklen_t *len) {
             if (errno == EINTR)
                 continue;
             else {
-                serverLog(LL_DEBUG, "accept: %s", strerror(errno));
+                // serverLog(LL_DEBUG, "accept: %s", strerror(errno));
                 return ANET_ERR;
             }
         }
@@ -1148,7 +1148,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
     while (max--) {
         cfd = anetTcpAccept(fd, cip, sizeof(cip), &cport);
-        serverLog(LL_DEBUG, "client ip (%s) fd (%d)", cip, cfd);
+        // serverLog(LL_DEBUG, "client ip (%s) fd (%d)", cip, cfd);
         if (cfd == ANET_ERR) {
             if (errno != EWOULDBLOCK)
                 serverLog(LL_WARNING,
@@ -1191,12 +1191,13 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
     {
         nowtm = mstime();
-        if (lp->isopen && (lp->starttime+lp->mtime < nowtm)) {
+        /* Here you can only turn off the abnormal light */
+        if (lp->mtime != -1 && lp->isopen && (lp->starttime+lp->mtime < nowtm)) {
             lp->isopen = false;
             lp->mtime = 0;
             lp->starttime = 0;
             sdSendUdpPage(lp->close);
-            serverLog(LL_VERBOSE, "When time expires, turn off the signal light");
+            serverLog(LL_VERBOSE, "When time expires, turn off (%d) light", lp->id);
         }
     }
     return 0;
@@ -1403,7 +1404,7 @@ void readQueryFromClient(aeEventLoop *el, int fd, void *privdata, int mask) {
     
     if (c->querybuf != NULL) {
         qblen = c->len;
-        serverLog(LL_VERBOSE, "Reading Data Length (%d)", qblen);
+        // serverLog(LL_VERBOSE, "Reading Data Length (%d)", qblen);
     }
 
     /* +1 for adding terminator*/
@@ -1632,7 +1633,7 @@ static void showLamplist(void) {
     {
         printf("\t--(%" PRIu16 ") %s:%s (%s)--\n", 
             lp->id, lp->open, lp->close,
-            lp->isopen ? "true" : "false");
+            lp->isopen ? "on" : "off");
     }
 }
 
@@ -1665,7 +1666,7 @@ static void freeLamp(void) {
     }
 }
 
-#define DEFAULT_LAMP_MTIME 2000  //2s
+#define DEFAULT_LAMP_MTIME -1  //2s
 static int SetSingleLamp(uint16_t id, uint16_t act, long long mt) {
     int flag = 0;
     Lamp *lp;
@@ -1699,6 +1700,12 @@ static int SetSingleLamp(uint16_t id, uint16_t act, long long mt) {
                     /* Set the light to be turned on, 
                      * and the current state of the light is off*/
                     lp->isopen = true;
+
+                    /* If mt > 0, it means the abnormal light is turned on. 
+                     * If the normal light is turned on, it is -1, 
+                     * because the normal light is required to be turned 
+                     * on all the time without timeout.
+                     */
                     lp->starttime = mstime();
                     lp->mtime = (mt > 0 ? mt : DEFAULT_LAMP_MTIME);
 
@@ -2032,8 +2039,8 @@ static void version(void) {
 
 static void usage(void) {
     fprintf(stderr,"Usage: ./sandtable [/path/to/config.conf]\n");
-    fprintf(stderr,"       ./redis-server -v or --version\n");
-    fprintf(stderr,"       ./redis-server -h or --help\n");
+    fprintf(stderr,"       ./sandtable -v or --version\n");
+    fprintf(stderr,"       ./sandtable -h or --help\n");
     fprintf(stderr,"Examples:\n");
     fprintf(stderr,"       ./sandtable (run the server with default conf)\n");
     fprintf(stderr,"       ./sandtable /etc/sandtable/config.conf\n");
