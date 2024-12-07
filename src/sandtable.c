@@ -133,6 +133,14 @@
 #define CONFIG_DEFAULT_FILE                 "./config.conf"
 #define CONFIG_READ_LEN                     1024
 
+
+#define LAMP_NORMAL                         0x00
+#define LAMP_ATTACK                         0x01
+#define LAMP_ALLOPEN                        0x02
+#define LAMP_ALLCLOSE                       0x03
+#define LAMP_ALLOPEN_ATTACK                 0x04
+#define LAMP_ALLOPEN_NORMAL                 0x05
+
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
 #define serverLog(level, ...) do {      \
@@ -168,6 +176,18 @@ typedef struct Lamp {
     long long mtime;        /* If the light is on, how long does it take before it turns off?*/
     bool isopen;            /* Is the light on? */
 } Lamp;
+
+typedef struct Lamp2 {
+    struct list_head list;
+    uint16_t id;            /* lamp index */
+    int flag;               /* 0: normal lamp 1: attack lamp  */
+    char *dst;              /* lamp description */
+    char **cmds;            /* open lamp command */
+    long long starttime;    /* open time */
+    long long mtime;        /* If the light is on, how long does it take before it turns off?*/
+    bool isopen;            /* Is the light on? */
+    uint16_t pair;          /* Pairing lamp */
+} Lamp2;
 
 /* File event structure */
 typedef struct aeFileEvent {
@@ -216,6 +236,7 @@ typedef struct aeEventLoop {
 
 struct Server {
     char *configfile;       /* config file path */
+    char *lampfile;         /* lamp config file path */
     int daemonize;          /* True if running as a daemon */
     char *udpip;            /* Sandbox router address*/
     char *tcpip;            /* TCP address*/
@@ -1809,6 +1830,181 @@ static char *GetLamp(uint16_t id) {
     return jstr;
 }
 
+/***************************LAMP2********************************************/
+
+static int SetSingleLamp2(uint16_t id, uint16_t act, long long mt) {
+}
+
+static Lamp2 *createLamp2(uint16_t id, int flag, char *dst, char **cmds, uint16_t pair) {
+    Lamp2 *lp = malloc(sizeof(*lp));
+
+    if (lp == NULL) return NULL;
+    memset(lp, 0, sizeof(*lp));
+
+    lp->starttime = 0;
+    lp->mtime = 0;
+    lp->id = id;
+    lp->flag = flag;
+    lp->dst = strdup(dst);
+    lp->cmds = cmds;
+    lp->isopen = false;
+    lp->pair = pair;
+
+    list_add(&lp->list, &sdserver.lamplist);
+    sdserver.lamp_size++;
+
+    return lp;
+}
+
+/*
+ * lamp_read_file()
+ * Read the lamp configuration file
+ * Remember to release the return value
+ */
+static char *lamp_read_file(void) {
+    FILE *fp;
+    long filesize;
+    char *buf = NULL;
+
+    fp = fopen(sdserver.lampfile, "r");
+    if (fp == NULL) {
+        serverLog(LL_WARNING, "Error open config file");
+        return NULL;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    filesize = ftell(fp);
+    rewind(fp);
+
+    buf = (char*)malloc(filesize+1);
+    if (buf == NULL) {
+        serverLog(LL_WARNING, "lamp_read_file() Error malloc");
+        fclose(fp);
+        return NULL;
+    }
+
+    fread(buf, 1, filesize, fp);
+    buf[filesize] = '\0';
+    fclose(fp);
+
+    return buf;
+}
+
+static void lamp_parse_data(const char *json_data) {
+    cJSON *root;
+    cJSON *lamp = NULL;
+    cJSON *lamps = NULL;
+
+    root = cJSON_Parse(json_data);
+    if (root == NULL) {
+        serverLog(LL_WARNING, "lamp_parse_data() Error cJSON_Parse");
+        exit(1);
+    }
+
+    lamps = cJSON_GetObjectItemCaseSensitive(root, "lamps");
+    if (!cJSON_IsArray(lamps)) {
+        serverLog(LL_WARNING, "No valid 'lamps' array found");
+        cJSON_Delete(root);
+        exit(1);
+    }
+
+    cJSON_ArrayForEach(lamp, lamps) {
+        if (cJSON_IsObject(lamp)) {
+            uint16_t id, pair;
+            int flag;
+            char *dst; 
+            char **cmds;
+
+            cJSON *cid = cJSON_GetObjectItemCaseSensitive(lamp, "id");
+            cJSON *cflag = cJSON_GetObjectItemCaseSensitive(lamp, "flag");
+            cJSON *cdst = cJSON_GetObjectItemCaseSensitive(lamp, "dst");
+            cJSON *ccmd = cJSON_GetObjectItemCaseSensitive(lamp, "cmd");
+            cJSON *cpair = cJSON_GetObjectItemCaseSensitive(lamp, "pair");
+
+            if (cJSON_IsNumber(cid)) {
+                int v = cid->valueint;
+
+                if (v >= 0 && v <= UINT16_MAX) {
+                    id = (uint16_t)v;
+                } else {
+                    serverLog(LL_WARNING, "Invalid lamp id");
+                    exit(1);
+                }
+            } else {
+                serverLog(LL_WARNING, "Invalid lamp id");
+                exit(1);
+            }
+
+            if (cJSON_IsNumber(cflag)) {
+                flag = cflag->valueint;
+            } else {
+                serverLog(LL_WARNING, "Invalid lamp flag");
+                exit(1);
+            }
+
+            if (cJSON_IsString(cdst) && cdst->valuestring) {
+                dst = cdst->valuestring;
+            } else {
+                serverLog(LL_WARNING, "Invalid lamp dst");
+                exit(1);
+            }
+
+            if (cJSON_IsNumber(cpair)) {
+                int v = cpair->valueint;
+
+                if (v >= 0 && v <= UINT16_MAX) {
+                    pair = (uint16_t)v;
+                } else {
+                    serverLog(LL_WARNING, "Invalid lamp pair");
+                    exit(1);
+                }
+            } else {
+                serverLog(LL_WARNING, "Invalid lamp pair");
+                exit(1);
+            }
+
+            if (cJSON_IsArray(ccmd)) {
+                cJSON *command = NULL;
+                int i = 0;
+
+                cmds = malloc(sizeof(char*) * cJSON_GetArraySize(ccmd));
+                cJSON_ArrayForEach(command, ccmd) {
+                    if (cJSON_IsString(command)) {
+                        cmds[i++] = strdup(command->valuestring);
+                    } else {
+                        serverLog(LL_WARNING, "Invalid lamp cmd");
+                        exit(1);
+                    }
+                }
+            } else {
+                serverLog(LL_WARNING, "Invalid lamp cmd");
+                exit(1);
+            }
+
+            (void)createLamp2(id, flag, dst, cmds, pair);
+        } else {
+            serverLog(LL_WARNING, "Invalid lamp object");
+            exit(1);
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+static void InitLamp2(void) {
+    char *data = NULL;
+
+    data = lamp_read_file();
+    if (data == NULL) {
+        serverLog(LL_WARNING, "lamp_read_file() Error lamp_read_file");
+        exit(1);
+    }
+
+    lamp_parse_data(data);
+    serverLog(LL_NOTICE, "Lamp config file loaded.");
+
+    free(data);
+}
 /*******************************API*************************************/
 const char *json_template = "{\"code\": \"%s\", \"describe\": \"%s (%" PRIu16 ") %s\"}";
 const char *error_template = "{\"code\": \"%s\", \"describe\": \"%s\"}";
