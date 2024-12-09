@@ -7,9 +7,9 @@ def connect_to_tcp_server(host='localhost', port=8899):
     data = {
         "method": "set",
         "lamp": {
-            "id": 9,
+            "id": 0,
             "action": 1,
-            "mtime": 10
+            "mtime": -1
         }
     }
     json_data = json.dumps(data)

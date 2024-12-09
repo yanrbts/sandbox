@@ -138,6 +138,10 @@
 #define LAMP_NORMAL                         0
 #define LAMP_ATTACK                         1
 #define LAMP_ALL                            -1
+#define LAMP_ALL_ATTACK                     2
+#define LAMP_ALL_NORMAL                     3
+#define LAMP_ALL_OPEN                       4
+#define LAMP_ALL_CLOSE                      5
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
@@ -1891,27 +1895,64 @@ static Lamp2 *FindLamp2ById(uint16_t id) {
     return NULL;
 }
 
-static void ModifyLamp2Status(Lamp2 *lp, bool isopen) {
+static void ModifyLamp2Status(Lamp2 *lp) {
     Lamp2 *l;
     Lamp2 *t;
 
     list_for_each_entry_safe(l, t, &sdserver.lamplist, list)
     {
-        if (lp->id == l->id || l->flag == LAMP_ALL)
+        if (lp->id == l->id)
             continue;
-        l->isopen = (isopen ? true : false);
+        
+        switch (lp->flag) {
+        case LAMP_ALL_OPEN: l->isopen = true; break; 
+        case LAMP_ALL_CLOSE: l->isopen = false; break;
+        case LAMP_ALL_ATTACK: 
+            {
+                if (l->flag == LAMP_NORMAL)
+                    l->isopen = false;
+                else if (l->flag == LAMP_ATTACK)
+                    l->isopen = true;
+                break;
+            }
+        case LAMP_ALL_NORMAL:
+            {
+                if (l->flag == LAMP_NORMAL)
+                    l->isopen = true;
+                else if (l->flag == LAMP_ATTACK)
+                    l->isopen = false;
+                break;
+            }
+        default: break;
+        }
     }
 }
 
-static int SendLamp2Cmd(Lamp2 *lp, bool isopen) {
+static int SendLamp2Cmd(Lamp2 *lp, bool isaction) {
     int i = 0;
     Lamp2 *t;
 
-    if (isopen) {
+    /* execute command */
+    if (isaction) {
         t = lp;
     } else {
-        t = FindLamp2ById(lp->pair);
-        t->isopen = true;
+        /* close command */
+        switch (lp->flag) {
+        case LAMP_ATTACK:
+        case LAMP_NORMAL:
+            t = FindLamp2ById(lp->pair);
+            t->isopen = true;
+            break;
+        case LAMP_ALL:
+        case LAMP_ALL_OPEN:
+        case LAMP_ALL_CLOSE:
+        case LAMP_ALL_ATTACK:
+        case LAMP_ALL_NORMAL:
+        default:
+            serverLog(LL_WARNING, "The lamp (%hu) Execution shutdown is invalid flag (%d)", 
+                    lp->id, lp->flag);
+            return C_ERR;
+        }
     }
 
     while (t->cmds[i] != NULL) {
@@ -1919,7 +1960,7 @@ static int SendLamp2Cmd(Lamp2 *lp, bool isopen) {
         i++;
     }
 
-    ModifyLamp2Status(t, isopen);
+    ModifyLamp2Status(t);
 
     return C_OK;
 }
@@ -2078,7 +2119,11 @@ static void lamp_parse_data(const char *json_data) {
                 flag = cflag->valueint;
                 if (flag != LAMP_ALL 
                     && flag != LAMP_NORMAL 
-                    && flag != LAMP_ATTACK) {
+                    && flag != LAMP_ATTACK
+                    && flag != LAMP_ALL_ATTACK
+                    && flag != LAMP_ALL_NORMAL
+                    && flag != LAMP_ALL_OPEN
+                    && flag != LAMP_ALL_CLOSE) {
                     serverLog(LL_WARNING, "Invalid lamp %d flag, it is not Effective identification(-1,0,1)", flag);
                     cJSON_Delete(root);
                     exit(1);
