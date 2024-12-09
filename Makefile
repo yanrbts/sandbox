@@ -1,6 +1,6 @@
 # 定义变量
 CC = gcc
-CFLAGS = -Wall -Wno-unused-function -I./src
+CFLAGS = -Wall -ggdb -Wno-unused-function -I./src
 SRCDIR = src
 OBJDIR = obj
 TARGET = sandtable

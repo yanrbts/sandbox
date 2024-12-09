@@ -7,7 +7,7 @@ def connect_to_tcp_server(host='localhost', port=8899):
     data = {
         "method": "set",
         "lamp": {
-            "id": 1,
+            "id": 9,
             "action": 1,
             "mtime": 10
         }
