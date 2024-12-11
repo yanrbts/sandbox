@@ -257,6 +257,7 @@ struct Server {
     size_t client_max_querybuf_len; /* Limit for client query buffer length */
     /* epoll */
     aeEventLoop *el;        /* main event loop object*/
+    uint32_t fadetime;      /* light gradient time */
 } sdserver;
 
 void sdserverFreeConfig(void);
@@ -1365,7 +1366,12 @@ static void loadConfigFile(void) {
             if ((sdserver.daemonize = yesnotoi(second)) == -1) {
                 err = "argument must be 'yes' or 'no'"; goto loaderr;
             }
-        } 
+        } else if (!strcasecmp(first, "fadetime")) {
+            sdserver.fadetime = atoi(second);
+            if (sdserver.udpport < 0) {
+                err = "Invalid fadetime"; goto loaderr;
+            }
+        }
         // else {
         //     // (void)createLamp(zstrdup(first), zstrdup(second));
         //     goto loaderr;
@@ -1395,6 +1401,7 @@ void initServerConfig() {
     sdserver.configfile = zstrdup(CONFIG_DEFAULT_FILE);
     sdserver.lampfile = zstrdup(CONFIG_DEFAULT_LAMP_FILE);
     sdserver.daemonize = 0;
+    sdserver.fadetime = 0;
 }
 
 void sdserverFreeConfig(void) {
@@ -1957,8 +1964,23 @@ static void ModifyLamp2AllOpenCloseStatus(Lamp2 *lp) {
     }
 }
 
-static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
+static void SendLamp2Cmd(Lamp2 *lp) {
     int i = 0;
+
+    while (lp->cmds[i] != NULL) {
+        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
+
+        /* To set the light to a gradual fade effect with 
+         * an interval pause time measured in milliseconds, 
+         * the program will convert the milliseconds to 
+         * microseconds and use the usleep function to pause.*/
+        if (sdserver.fadetime > 0)
+            usleep(sdserver.fadetime * 1000);
+        i++;
+    }
+}
+
+static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
     Lamp2 *tmp;
 
     if (lp->flag == LAMP_NORMAL && mt > 0) {
@@ -1984,16 +2006,11 @@ static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
     tmp->mtime = 0;
     tmp->starttime = 0;
     
-    while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
-        i++;
-    }
+    SendLamp2Cmd(lp);
     return C_OK;
 }
 
 static int SetLamp2AllNomalAttack(Lamp2 *lp, long long mt) {
-    int i = 0;
-
     if (lp->flag == LAMP_ALL_NORMAL && mt > 0) {
         serverLog(LL_DEBUG, "\033[32mall normal lamp (%hu) mtine It should be 0\033[0m", lp->id);
         mt = 0;
@@ -2014,31 +2031,22 @@ static int SetLamp2AllNomalAttack(Lamp2 *lp, long long mt) {
 
     ModifyLamp2AllNormalAttackStatus(lp, mt);
     
-    while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
-        i++;
-    }
+    SendLamp2Cmd(lp);
     return C_OK;
 }
 
 static int SetLamp2AllOpenClose(Lamp2 *lp) {
-    int i = 0;
-
     lp->starttime = mstime();
     lp->mtime = 0;
     lp->isopen = true;
 
     ModifyLamp2AllOpenCloseStatus(lp);
     
-    while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
-        i++;
-    }
+    SendLamp2Cmd(lp);
     return C_OK;
 }
 
 static int SetLamp2OpenClose(Lamp2 *lp, long long mt) {
-    int i = 0;
     Lamp2 *l;
     Lamp2 *l2;
     Lamp2 *t2;
@@ -2075,10 +2083,7 @@ static int SetLamp2OpenClose(Lamp2 *lp, long long mt) {
         }
     }
 
-    while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
-        i++;
-    }
+    SendLamp2Cmd(lp);
     return C_OK;
 }
 
