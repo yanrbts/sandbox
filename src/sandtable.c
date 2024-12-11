@@ -137,11 +137,12 @@
 
 #define LAMP_NORMAL                         0
 #define LAMP_ATTACK                         1
-#define LAMP_ALL                            -1
 #define LAMP_ALL_ATTACK                     2
 #define LAMP_ALL_NORMAL                     3
 #define LAMP_ALL_OPEN                       4
 #define LAMP_ALL_CLOSE                      5
+#define LAMP_OPEN                           6
+#define LAMP_CLOSE                          7    
 
 /* Use macro for checking log level to avoid evaluating arguments in cases log
  * should be ignored due to low level. */
@@ -262,7 +263,7 @@ void sdserverFreeConfig(void);
 static Client *createClient(int fd);
 static void freeClient(Client *c);
 static void setupSignalHandlers(void);
-static int sdSendUdpPage(const char *msg, const char *dst);
+static int sdSendUdpPage(const char *msg, const char *dst, int flag);
 static char *zstrdup(const char *s);
 static Lamp *createLamp(char *op, char *cl);
 static void showLamplist(void);
@@ -281,7 +282,7 @@ static int SetSingleLamp2Exc(uint16_t id, long long mt);
 /********************************LOGO*********************************/
 
 static const char *ascii_logo =                           
-"               _ _       _   _     \n"  
+"\033[32m               _ _       _   _\n"  
 " ___ ___ ___ _| | |_ ___| |_| |___ \n"
 "|_ -| .'|   | . |  _| .'| . | | -_|\n"
 "|___|__,|_|_|___|_| |__,|___|_|___|\n\n"
@@ -289,7 +290,7 @@ static const char *ascii_logo =
 "        PID: %ld\n"
 "        tcp: %s:%d\n"
 "        udp: %s:%d\n"
-"        author: yanruibing\n\n";
+"        author: yanruibing\033[0m\n\n";
                                    
 
 
@@ -321,7 +322,7 @@ static void sLogRaw(int level, const char *msg) {
 		const char err_msg[] = "(NO TIME AVAILABLE)";
 		memcpy(time_buf, err_msg, sizeof(err_msg));
 	}
-    fprintf(fp,"[%d]:%s %c %s\n",
+    fprintf(fp,"\033[90m[%d]:%s %c \033[0m%s\n",
             (int)getpid(), time_buf, c[level], msg);
 
     fflush(fp);
@@ -1226,23 +1227,23 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
         nowtm = mstime();
         /* Here you can only turn off the abnormal light */
         if (lp->mtime > 0 
-            && (lp->flag & LAMP_ATTACK || lp->flag & LAMP_ALL_ATTACK)
+            && (lp->flag == LAMP_ATTACK || lp->flag == LAMP_ALL_ATTACK)
             && lp->isopen 
             && (lp->starttime+lp->mtime < nowtm)) {
             lp->isopen = false;
             lp->mtime = 0;
             lp->starttime = 0;
 
-            if (lp->flag & LAMP_ATTACK) {
+            if (lp->flag == LAMP_ATTACK) {
                 tmp = FindLamp2ById(lp->pair);
                 tmp->isopen = true;
                 tmp->mtime = 0;
                 tmp->starttime = mstime();
                 while (tmp->cmds[i] != NULL) {
-                    sdSendUdpPage(tmp->cmds[i], tmp->dst);
+                    sdSendUdpPage(tmp->cmds[i], tmp->dst, tmp->flag);
                     i++;
                 }
-                serverLog(LL_VERBOSE, "When time expires, turn off (%d) light", lp->id);
+                serverLog(LL_VERBOSE, "\033[36mWhen time expires, turn off\033[0m \033[33m(%d)\033[0m \033[36mlight\033[0m", lp->id);
             }  
         }
         i = 0;
@@ -1744,91 +1745,6 @@ static void freeLamp(void) {
     }
 }
 
-#define DEFAULT_LAMP_MTIME -1  //2s
-static int SetSingleLamp(uint16_t id, uint16_t act, long long mt) {
-    int flag = 0;
-    Lamp *lp;
-    Lamp *t;
-
-    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
-    {
-        /* When id is 0, process all lights, 
-         * otherwise only process matching lights */
-        if (id != 0 && lp->id == id) {
-            flag = 1;
-            /* The light is on */
-            if (lp->isopen) {
-                if (act > 0) {
-                    /* Update duration */
-                    if (mt > 0) {
-                        lp->starttime = mstime();
-                        lp->mtime = mt;
-                    }
-                    serverLog(LL_DEBUG, "The light (%hu) is already on", lp->id);
-                } else {
-                    /* Set the light to be off, and the light is currently on*/
-                    lp->isopen = false;
-                    /* turn off lights */
-                    serverLog(LL_DEBUG, "Turn off the light (%hu)", lp->id);
-                    sdSendUdpPage(lp->close, NULL);
-                }
-            } else {
-                /* The light is off */
-                if (act > 0) {
-                    /* Set the light to be turned on, 
-                     * and the current state of the light is off*/
-                    lp->isopen = true;
-
-                    /* If mt > 0, it means the abnormal light is turned on. 
-                     * If the normal light is turned on, it is -1, 
-                     * because the normal light is required to be turned 
-                     * on all the time without timeout.
-                     */
-                    lp->starttime = mstime();
-                    lp->mtime = (mt > 0 ? mt : DEFAULT_LAMP_MTIME);
-
-                    /* turn on the light */
-                    serverLog(LL_DEBUG, "Turn on the light (%hu)", lp->id);
-                    sdSendUdpPage(lp->open, NULL);
-                } else {
-                    serverLog(LL_DEBUG, "The light (%hu) is already off", lp->id);
-                }
-            }
-            break;
-        }
-    }
-    return  flag ? C_OK : C_ERR;
-}
-
-static int SetAllLamp(uint16_t id, uint16_t act, long long mt) {
-    Lamp *lp;
-    Lamp *t;
-
-    if (id != 0) return C_ERR;
-
-    /* Find the 0th light */
-    list_for_each_entry_safe(lp, t, &sdserver.lamplist, list) {
-        if (act > 0) {
-            lp->isopen = true;
-            lp->starttime = mstime();
-            lp->mtime = (mt > 0 ? mt : DEFAULT_LAMP_MTIME);
-
-            /* If the 0 number is found, send all open commands */
-            if (lp->id == id)
-                sdSendUdpPage(lp->open, NULL);
-        } else {
-            lp->isopen = false;
-            lp->starttime = 0;
-            lp->mtime = 0;
-
-            /* If the 0 number is found, send all close commands */
-            if (lp->id == id)
-                sdSendUdpPage(lp->close, NULL);
-        }
-    }
-    return  C_OK;
-}
-
 static int SetLamp(uint16_t id, long long mt) {
     // return SetSingleLamp2(id, act, mt);
     return SetSingleLamp2Exc(id, mt);
@@ -1892,12 +1808,40 @@ static void showLamp2list(void) {
     Lamp2 *lp = NULL;
     Lamp2 *t = NULL;
 
-    serverLog(LL_WARNING, "Lamp Number : %" PRIu32 "", sdserver.lamp_size);
+    serverLog(LL_WARNING, "Lamp Number : \033[33m%" PRIu32 "\033[0m", sdserver.lamp_size);
     list_for_each_entry_safe(lp, t, &sdserver.lamplist, list)
     {
-        printf("\t--(%" PRIu16 ") %s:%d (%s)--\n", 
-            lp->id, lp->dst, lp->flag,
-            lp->isopen ? "on" : "off");
+        switch (lp->flag) {
+        case LAMP_OPEN:
+        case LAMP_CLOSE:
+            printf("\t--(\033[33m%" PRIu16 "\033[0m) \033[90m%s\033[0m:%d (%s)--\n", 
+                    lp->id, lp->dst, lp->flag,
+                    lp->isopen ? "on" : "off");
+            break;
+        case LAMP_NORMAL:
+        case LAMP_ALL_NORMAL:
+            printf("\t--(\033[33m%" PRIu16 "\033[0m) \033[32m%s\033[0m:%d (%s)--\n", 
+                    lp->id, lp->dst, lp->flag,
+                    lp->isopen ? "on" : "off");
+            break;
+        case LAMP_ATTACK:
+        case LAMP_ALL_ATTACK:
+            printf("\t--(\033[33m%" PRIu16 "\033[0m) \033[31m%s\033[0m:%d (%s)--\n", 
+                    lp->id, lp->dst, lp->flag,
+                    lp->isopen ? "on" : "off");
+            break;
+        case LAMP_ALL_OPEN:
+        case LAMP_ALL_CLOSE:
+            printf("\t--(\033[33m%" PRIu16 "\033[0m) \033[34m%s\033[0m:%d (%s)--\n", 
+                    lp->id, lp->dst, lp->flag,
+                    lp->isopen ? "on" : "off");
+            break;
+        default:
+            break;
+        }
+        // printf("\t--(%" PRIu16 ") %s:%d (%s)--\n", 
+        //     lp->id, lp->dst, lp->flag,
+        //     lp->isopen ? "on" : "off");
     }
 }
 
@@ -1916,13 +1860,32 @@ static Lamp2 *FindLamp2ById(uint16_t id) {
 
 
 /******************************EXC**********************************/
+
 static void ModifyLamp2AllNormalAttackStatus(Lamp2 *lp, long long mt) {
     Lamp2 *l;
     Lamp2 *t;
 
     list_for_each_entry_safe(l, t, &sdserver.lamplist, list)
     {
-        if (lp->id == l->id) continue;
+        if (lp->id == l->id)
+            continue;
+
+        if (lp->pair == l->id) {
+            l->isopen = false;
+            l->starttime = 0;
+            l->mtime = 0;
+            continue;
+        }
+
+        /* During all attacks, all close and 
+         * all open controls are disabled.*/
+        if (l->flag == LAMP_ALL_OPEN 
+            || l->flag == LAMP_ALL_CLOSE) {
+            l->isopen = false;
+            l->starttime = 0;
+            l->mtime = 0;
+            continue;
+        }
 
         if (lp->flag == LAMP_ALL_ATTACK) {
             if (l->flag == LAMP_ATTACK) {
@@ -1954,13 +1917,39 @@ static void ModifyLamp2AllOpenCloseStatus(Lamp2 *lp) {
 
     list_for_each_entry_safe(l, t, &sdserver.lamplist, list)
     {
-        if (lp->id == l->id) continue;
+        if (lp->id == l->id)
+            continue;
 
         if (lp->flag == LAMP_ALL_OPEN) {
+            if (lp->pair == l->id) {
+                l->isopen = false;
+                l->starttime = 0;
+                l->mtime = 0;
+                continue;
+            }
+
+            /* When all lights are turned on, 
+             * other off switches are not set */
+            if (l->flag == LAMP_CLOSE) {
+                l->isopen = false;
+                l->starttime = 0;
+                l->mtime = 0;
+                continue;
+            }
+
             l->isopen = true;
             l->starttime = mstime();
             l->mtime = 0;
         } else if (lp->flag == LAMP_ALL_CLOSE) {
+            /* When all lights are turned off, 
+             * other open switches are not set. */
+            if (l->flag == LAMP_OPEN) {
+                l->isopen = false;
+                l->starttime = 0;
+                l->mtime = 0;
+                continue;
+            }
+
             l->isopen = false;
             l->starttime = 0;
             l->mtime = 0;
@@ -1972,16 +1961,18 @@ static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
     int i = 0;
     Lamp2 *tmp;
 
-    if (lp->flag == LAMP_NORMAL && mt > 0)
-        serverLog(LL_DEBUG, "normal lamp (%hu) mtine It should be 0", lp->id);
-    
+    if (lp->flag == LAMP_NORMAL && mt > 0) {
+        serverLog(LL_DEBUG, "\033[32normal lamp (%hu) mtine It should be 0\033[0m", lp->id);
+        mt = 0;
+    }
+
     if (lp->flag == LAMP_ATTACK) {
         if (mt == 0) {
-            serverLog(LL_DEBUG, "attack lamp (%hu) mtine It should be >0", lp->id);
+            serverLog(LL_DEBUG, "\033[31mattack lamp (%hu) mtine It should be (> 0 or = -1)\033[0m", lp->id);
             return C_ERR;
         }
         if (mt < 0)
-            serverLog(LL_DEBUG, "attack lamp (%hu) mtine Long-term opening", lp->id);
+            serverLog(LL_DEBUG, "\033[32attack lamp (%hu) mtine Long-term opening\033[0m", lp->id);
     }
 
     lp->starttime = mstime();
@@ -1994,7 +1985,7 @@ static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
     tmp->starttime = 0;
     
     while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst);
+        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
         i++;
     }
     return C_OK;
@@ -2003,16 +1994,18 @@ static int SetLamp2NomalAttack(Lamp2 *lp, long long mt) {
 static int SetLamp2AllNomalAttack(Lamp2 *lp, long long mt) {
     int i = 0;
 
-    if (lp->flag == LAMP_ALL_NORMAL && mt > 0)
-        serverLog(LL_DEBUG, "all normal lamp (%hu) mtine It should be 0", lp->id);
+    if (lp->flag == LAMP_ALL_NORMAL && mt > 0) {
+        serverLog(LL_DEBUG, "\033[32mall normal lamp (%hu) mtine It should be 0\033[0m", lp->id);
+        mt = 0;
+    }     
     
     if (lp->flag == LAMP_ALL_ATTACK) {
         if (mt == 0) {
-            serverLog(LL_DEBUG, "all attack lamp (%hu) mtine It should be >0", lp->id);
+            serverLog(LL_DEBUG, "\033[31mall attack lamp (%hu) mtine It should be (> 0 or = -1)\033[0m", lp->id);
             return C_ERR;
         }
         if (mt < 0)
-            serverLog(LL_DEBUG, "all attack lamp (%hu) mtine Long-term opening", lp->id);
+            serverLog(LL_DEBUG, "\033[32mall attack lamp (%hu) mtine Long-term opening\033[0m", lp->id);
     }
 
     lp->starttime = mstime();
@@ -2022,7 +2015,7 @@ static int SetLamp2AllNomalAttack(Lamp2 *lp, long long mt) {
     ModifyLamp2AllNormalAttackStatus(lp, mt);
     
     while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst);
+        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
         i++;
     }
     return C_OK;
@@ -2038,24 +2031,52 @@ static int SetLamp2AllOpenClose(Lamp2 *lp) {
     ModifyLamp2AllOpenCloseStatus(lp);
     
     while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst);
+        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
         i++;
     }
     return C_OK;
 }
 
-static int SetLamp2All(Lamp2 *lp, long long mt) {
+static int SetLamp2OpenClose(Lamp2 *lp, long long mt) {
     int i = 0;
+    Lamp2 *l;
+    Lamp2 *l2;
+    Lamp2 *t2;
 
-    if (lp->flag == LAMP_ALL && mt > 0)
-        serverLog(LL_DEBUG, "all lamp (%hu) mtine It should be 0", lp->id);
+    if (mt > 0) {
+        serverLog(LL_DEBUG, "\033[33mSingle Open or Close lamp (%hu) mtine It should be 0\033[0m", lp->id);
+        mt = 0;
+    }  
 
     lp->starttime = mstime();
-    lp->mtime = 0;
+    lp->mtime = mt;
     lp->isopen = true;
-    
+
+    l = FindLamp2ById(lp->pair);
+    l->isopen = false;
+    l->mtime = mt;
+    l->starttime = 0;
+
+    list_for_each_entry_safe(l2, t2, &sdserver.lamplist, list)
+    {
+        if (lp->id == l2->id) continue;
+        if (lp->flag == LAMP_OPEN 
+            && l2->flag == LAMP_ALL_CLOSE) {
+            l2->isopen = false;
+            l2->mtime = mt;
+            l2->starttime = 0;
+        }
+
+        if (lp->flag == LAMP_CLOSE 
+            && l2->flag == LAMP_ALL_OPEN) {
+            l2->isopen = false;
+            l2->mtime = mt;
+            l2->starttime = 0;
+        }
+    }
+
     while (lp->cmds[i] != NULL) {
-        sdSendUdpPage(lp->cmds[i], lp->dst);
+        sdSendUdpPage(lp->cmds[i], lp->dst, lp->flag);
         i++;
     }
     return C_OK;
@@ -2075,8 +2096,9 @@ static int SetSingleLamp2Exc(uint16_t id, long long mt) {
             case LAMP_NORMAL:
                 SetLamp2NomalAttack(lp, mt);
                 break;
-            case LAMP_ALL:
-                SetLamp2All(lp, mt);
+            case LAMP_OPEN:
+            case LAMP_CLOSE:
+                SetLamp2OpenClose(lp, mt);
                 break;
             case LAMP_ALL_OPEN:
             case LAMP_ALL_CLOSE:
@@ -2147,7 +2169,7 @@ static char *lamp_read_file(void) {
 
     fp = fopen(sdserver.lampfile, "r");
     if (fp == NULL) {
-        serverLog(LL_WARNING, "Error open config file");
+        serverLog(LL_WARNING, "\033[31mError open config file\033[0m");
         return NULL;
     }
 
@@ -2157,7 +2179,7 @@ static char *lamp_read_file(void) {
 
     buf = (char*)malloc(filesize+1);
     if (buf == NULL) {
-        serverLog(LL_WARNING, "lamp_read_file() Error malloc");
+        serverLog(LL_WARNING, "\033[31mlamp_read_file() Error malloc\033[0m");
         fclose(fp);
         return NULL;
     }
@@ -2176,13 +2198,13 @@ static void lamp_parse_data(const char *json_data) {
 
     root = cJSON_Parse(json_data);
     if (root == NULL) {
-        serverLog(LL_WARNING, "lamp_parse_data() Error cJSON_Parse");
+        serverLog(LL_WARNING, "\033[31mlamp_parse_data() Error cJSON_Parse\033[0m");
         exit(1);
     }
 
     lamps = cJSON_GetObjectItemCaseSensitive(root, "lamps");
     if (!cJSON_IsArray(lamps)) {
-        serverLog(LL_WARNING, "No valid 'lamps' array found");
+        serverLog(LL_WARNING, "\033[31mNo valid 'lamps' array found\033[0m");
         cJSON_Delete(root);
         exit(1);
     }
@@ -2206,31 +2228,32 @@ static void lamp_parse_data(const char *json_data) {
                 if (v >= 0 && v <= UINT16_MAX) {
                     id = (uint16_t)v;
                 } else {
-                    serverLog(LL_WARNING, "Invalid lamp id");
+                    serverLog(LL_WARNING, "\033[31mInvalid lamp id\033[0m");
                     cJSON_Delete(root);
                     exit(1);
                 }
             } else {
-                serverLog(LL_WARNING, "Invalid lamp id, it is not number");
+                serverLog(LL_WARNING, "\033[31mInvalid lamp id, it is not number\033[0m");
                 cJSON_Delete(root);
                 exit(1);
             }
 
             if (cJSON_IsNumber(cflag)) {
                 flag = cflag->valueint;
-                if (flag != LAMP_ALL 
+                if (flag != LAMP_OPEN
+                    && flag != LAMP_CLOSE 
                     && flag != LAMP_NORMAL 
                     && flag != LAMP_ATTACK
                     && flag != LAMP_ALL_ATTACK
                     && flag != LAMP_ALL_NORMAL
                     && flag != LAMP_ALL_OPEN
                     && flag != LAMP_ALL_CLOSE) {
-                    serverLog(LL_WARNING, "Invalid lamp %d flag, it is not Effective identification(-1,0,1)", flag);
+                    serverLog(LL_WARNING, "\033[31mInvalid lamp \033[33m%d\033[0m \033[31mflag, it is not Effective identification(-1,0,1)\033[0m", flag);
                     cJSON_Delete(root);
                     exit(1);
                 }
             } else {
-                serverLog(LL_WARNING, "Invalid lamp flag, it is not number");
+                serverLog(LL_WARNING, "\033[31mInvalid lamp flag, it is not number\033[0m");
                 cJSON_Delete(root);
                 exit(1);
             }
@@ -2238,7 +2261,7 @@ static void lamp_parse_data(const char *json_data) {
             if (cJSON_IsString(cdst) && cdst->valuestring) {
                 dst = cdst->valuestring;
             } else {
-                serverLog(LL_WARNING, "Invalid lamp dst, it is not string");
+                serverLog(LL_WARNING, "\033[31mInvalid lamp dst, it is not string\033[0m");
                 cJSON_Delete(root);
                 exit(1);
             }
@@ -2249,12 +2272,12 @@ static void lamp_parse_data(const char *json_data) {
                 if (v >= 0 && v <= UINT16_MAX) {
                     pair = (uint16_t)v;
                 } else {
-                    serverLog(LL_WARNING, "Invalid lamp pair");
+                    serverLog(LL_WARNING, "\033[31mInvalid lamp pair\033[0m");
                     cJSON_Delete(root);
                     exit(1);
                 }
             } else {
-                serverLog(LL_WARNING, "Invalid lamp pair, it is not number");
+                serverLog(LL_WARNING, "\033[31mInvalid lamp pair, it is not number\033[0m");
                 cJSON_Delete(root);
                 exit(1);
             }
@@ -2268,21 +2291,21 @@ static void lamp_parse_data(const char *json_data) {
                     if (cJSON_IsString(command)) {
                         cmds[i++] = strdup(command->valuestring);
                     } else {
-                        serverLog(LL_WARNING, "Invalid lamp cmd, it is not string");
+                        serverLog(LL_WARNING, "\033[31mInvalid lamp cmd, it is not string\033[0m");
                         cJSON_Delete(root);
                         exit(1);
                     }
                 }
                 cmds[i] = NULL;
             } else {
-                serverLog(LL_WARNING, "Invalid lamp ccmd, it is not array");
+                serverLog(LL_WARNING, "\033[31mInvalid lamp ccmd, it is not array\033[0m");
                 cJSON_Delete(root);
                 exit(1);
             }
 
             (void)createLamp2(id, flag, dst, cmds, pair);
         } else {
-            serverLog(LL_WARNING, "Invalid lamp object");
+            serverLog(LL_WARNING, "\033[31mInvalid lamp object\033[0m");
             cJSON_Delete(root);
             exit(1);
         }
@@ -2301,7 +2324,7 @@ static void InitLamp2(void) {
     }
 
     lamp_parse_data(data);
-    serverLog(LL_NOTICE, "Lamp config file loaded.");
+    serverLog(LL_NOTICE, "\033[32mLamp config file loaded.\033[0m");
 
     free(data);
 }
@@ -2427,14 +2450,14 @@ err:
 /*******************************UDP*************************************/
 
 /* Send udp packet to sandbox Control the sand table signal light on and off*/
-static int sdSendUdpPage(const char *msg, const char *dst) {
+static int sdSendUdpPage(const char *msg, const char *dst, int flag) {
     int sfd;
     ssize_t sent_len;
     struct sockaddr_in server_addr;
 
     sfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sfd < 0) {
-        serverLog(LL_DEBUG, "UDP Socket creation failed");
+        serverLog(LL_DEBUG, "\033[31mUDP Socket creation failed\033[0m");
         return C_ERR;
     }
 
@@ -2443,7 +2466,7 @@ static int sdSendUdpPage(const char *msg, const char *dst) {
     server_addr.sin_port = htons(sdserver.udpport);
     if (inet_pton(AF_INET, sdserver.udpip, &server_addr.sin_addr) <= 0) {
         close(sfd);
-        serverLog(LL_DEBUG, "inet_pton failed (%s)", strerror(errno));
+        serverLog(LL_DEBUG, "\033[31minet_pton failed (%s)\033[0m", strerror(errno));
         return C_ERR;
     }
 
@@ -2451,11 +2474,32 @@ static int sdSendUdpPage(const char *msg, const char *dst) {
         (struct sockaddr *)&server_addr, sizeof(server_addr));
     
     if (sent_len < 0) {
-        serverLog(LL_DEBUG, "UDP [%s : %s] Message send failed", dst, msg);
+        serverLog(LL_DEBUG, "\033[31mSend [%s : %s] cmd failed\033[0m", dst, msg);
         close(sfd);
         return C_ERR;
     }
-    serverLog(LL_DEBUG, "UDP [%s] Message sent successfully", dst);
+
+    switch (flag) {
+    case LAMP_OPEN:
+    case LAMP_CLOSE:
+        serverLog(LL_DEBUG, "\033[90mSend [%s] cmd successfully\033[0m", dst);
+        break;
+    case LAMP_NORMAL:
+    case LAMP_ALL_NORMAL:
+        serverLog(LL_DEBUG, "\033[32mSend [%s] cmd successfully\033[0m", dst);
+        break;
+    case LAMP_ATTACK:
+    case LAMP_ALL_ATTACK:
+        serverLog(LL_DEBUG, "\033[31mSend [%s] cmd successfully\033[0m", dst);
+        break;
+    case LAMP_ALL_OPEN:
+    case LAMP_ALL_CLOSE:
+        serverLog(LL_DEBUG, "\033[34mSend [%s] cmd successfully\033[0m", dst);
+        break;
+    default:
+        break;
+    }
+    // serverLog(LL_DEBUG, "\033[32mSend [%s] cmd successfully\033[0m", dst);
 
     close(sfd);
     return C_OK;

@@ -4,13 +4,13 @@ import struct
 import pandas as pd
 from tabulate import tabulate
 
-def connect_to_tcp_server(id, host='localhost', port=8899):
+def connect_to_tcp_server(id, mt, host='localhost', port=8899):
     # 创建一个复杂的结构化 JSON 数据
     data = {
         "method": "set",
         "lamp": {
             "id": id,
-            "mtime": 10
+            "mtime": mt
         }
     }
     json_data = json.dumps(data)
@@ -142,12 +142,14 @@ def main():
             break
 
         if user_input.startswith("open "):
-            number_part = user_input.split(" ")[1]
-            try:
-                number = int(number_part)
-                connect_to_tcp_server(id=number)
-            except ValueError:
-                print("Invalid input. Please enter a number.")
+            parts = user_input.split(" ")
+            if 2 <= len(parts) <= 3:
+                try:
+                    number = int(parts[1])
+                    mt = int(parts[2]) if len(parts) == 3 else 10
+                    connect_to_tcp_server(id=number, mt=mt)
+                except ValueError:
+                    print("Invalid input. Please enter a number.")
         
         if user_input.startswith("get"):
             connect_to_get_tcp_server(id=0)
