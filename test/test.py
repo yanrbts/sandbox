@@ -40,7 +40,7 @@ def connect_to_tcp_server(id, mt, host='localhost', port=8899):
             response_json = json.loads(response_str)
             formatted_response = json.dumps(response_json, indent=4, ensure_ascii=False)
             # print("Received response from server (formatted JSON):")
-            print(formatted_response)
+            # print(formatted_response)
         except json.JSONDecodeError:
             print("Failed to decode response as JSON. Raw response:")
             print(response_str)

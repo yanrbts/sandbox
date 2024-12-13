@@ -1,0 +1,13 @@
+[Unit]
+Description=Sandtable Service
+After=network-online.target
+
+[Service]
+WorkingDirectory=/usr/local/bin
+ExecStart=/usr/local/bin/sandtable /etc/sandtable/config.conf
+Restart=always
+User=nobody
+Group=nogroup
+
+[Install]
+WantedBy=multi-user.target
