@@ -134,6 +134,7 @@
 #define CONFIG_DEFAULT_LAMP_FILE            "./lamp.json"
 #define CONFIG_DEFAULT_PID_FILE             "/var/run/sandtable.pid"
 #define CONFIG_READ_LEN                     1024
+#define MAX_LOG_FILE_SIZE                   (100 * 1024 * 1024) /* 10 MB */
 
 
 #define LAMP_NORMAL                         0
@@ -252,6 +253,7 @@ struct Server {
     int tcp_backlog;        /* TCP listen() backlog */
     int tcpkeepalive;       /* Set SO_KEEPALIVE if non-zero. */
     char *logfile;          /* Path of log file */
+    int logfilesize;        /* logfile size*/
     struct list_head clist; /* List of client*/
     struct list_head clients_pending_write; /* There is to write or install handler. */
     uint32_t clist_size;    /* number of client */
@@ -269,6 +271,7 @@ static void freeClient(Client *c);
 static void setupSignalHandlers(void);
 static int sdSendUdpPage(const char *msg, const char *dst, int flag);
 static int sdSendTCPPage(const char *msg, const char *dst, int flag);
+static void SendLamp2Cmd(Lamp2 *lp);
 static char *zstrdup(const char *s);
 static Lamp *createLamp(char *op, char *cl);
 static void showLamplist(void);
@@ -301,16 +304,39 @@ static const char *ascii_logo =
 
 
 /*********************************LOG*********************************/
+static void rotate_log_file(const char *logfile) {
+    char new_logfile[256];
+    time_t now = time(NULL);
+    struct tm now_tm;
 
+    if (localtime_r(&now, &now_tm)) {
+        strftime(new_logfile, sizeof(new_logfile), "%Y-%m-%d_%H-%M-%S.log", &now_tm);
+        /* Rename log file */
+        rename(logfile, new_logfile); 
+    }
+}
+
+/* Detect if the file size exceeds 100 MB, 
+ * rename the file to the current time, 
+ * then create a new file, open it and write the log*/
 static void sLogRaw(int level, const char *msg) {
     const char *c = ".-*#@";
     FILE *fp;
     time_t now;
     struct tm now_tm, *lt_ret;
 	struct timeval tv;
+    struct stat st;
 	int off;
 	char time_buf[64];
     int log_to_stdout = sdserver.logfile[0] == '\0';
+
+    /* If the log file is not empty, check the size */
+    if (!log_to_stdout && stat(sdserver.logfile, &st) == 0) {
+        /* If it exceeds 100 MB, perform log rotation */
+        if (st.st_size >= sdserver.logfilesize) {
+            rotate_log_file(sdserver.logfile);
+        }
+    }
 
     fp = log_to_stdout ? stdout : fopen(sdserver.logfile,"a");
     if (!fp) return;
@@ -1220,7 +1246,7 @@ void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     Lamp2 *lp;
     Lamp2 *t, *tmp;
-    int i = 0;
+    // int i = 0;
     long long nowtm;
 
     AE_NOTUSED(eventLoop);
@@ -1244,16 +1270,18 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
                 tmp->isopen = true;
                 tmp->mtime = 0;
                 tmp->starttime = mstime();
-                while (tmp->cmds[i] != NULL) {
-                    // sdSendUdpPage(tmp->cmds[i], tmp->dst, tmp->flag);
-                    // usleep(1000000*5);
-                    sdSendTCPPage(tmp->cmds[i], tmp->dst, tmp->flag);
-                    i++;
-                }
+
+                SendLamp2Cmd(tmp);
+                // while (tmp->cmds[i] != NULL) {
+                //     // sdSendUdpPage(tmp->cmds[i], tmp->dst, tmp->flag);
+                //     // usleep(1000000*5);
+                //     sdSendTCPPage(tmp->cmds[i], tmp->dst, tmp->flag);
+                //     i++;
+                // }
                 serverLog(LL_VERBOSE, "\033[36mWhen time expires, turn off\033[0m \033[33m(%d)\033[0m \033[36mlight\033[0m", lp->id);
             }  
         }
-        i = 0;
+        // i = 0;
     }
     return C_OK;
 }
@@ -1380,6 +1408,12 @@ static void loadConfigFile(void) {
         } else if (!strcasecmp(first, "pidfile")) {
             free(sdserver.pidfile);
             sdserver.pidfile = zstrdup(second);
+        } else if (!strcasecmp(first, "logfilesize")) {
+            sdserver.logfilesize = atoi(second);
+            if (sdserver.logfilesize < 5 || sdserver.logfilesize > 400) {
+                err = "Invalid port, logfilesize requirement is between 5 MB and 400 MB"; 
+                goto loaderr;
+            }
         }
     }
     fclose(fp);
@@ -1408,6 +1442,7 @@ void initServerConfig() {
     sdserver.daemonize = 0;
     sdserver.fadetime = 0;
     sdserver.pidfile = NULL;
+    sdserver.logfilesize = MAX_LOG_FILE_SIZE;
 }
 
 void sdserverFreeConfig(void) {
